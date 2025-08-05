@@ -67,7 +67,7 @@ impl Store {
 
         match &mut entry.value_mut().data {
             DataType::List(list) => {
-                for value in values.iter().rev() {
+                for value in values {
                     list.push_front(value.clone());
                 }
                 Ok(list.len())
