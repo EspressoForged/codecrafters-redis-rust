@@ -41,7 +41,7 @@ pub enum Command {
 }
 
 /// Represents a command parsed from a RESP message, including its arguments.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParsedCommand {
     command: Command,
     args: Vec<Bytes>,

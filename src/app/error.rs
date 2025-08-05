@@ -23,4 +23,8 @@ pub enum AppError {
     /// Operation against a key holding the wrong kind of value.
     #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
     WrongType,
+
+    /// A value could not be parsed as the required type (e.g., for INCR).
+    #[error("ERR {0}")]
+    ValueError(String),
 }

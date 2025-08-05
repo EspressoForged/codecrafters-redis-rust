@@ -1,23 +1,30 @@
 use crate::app::{
     command::{Command, ParsedCommand},
-    error::AppError,
-    protocol::{RespDecoder, RespValue},
-    store::{Store, WRONGTYPE_ERROR},
+    store::Store,
     wait::WaiterRegistry,
 };
+use crate::app::protocol::{RespDecoder, RespValue};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 pub mod command;
 pub mod error;
 pub mod protocol;
 pub mod store;
 pub mod wait;
+
+/// Represents the state of a single client connection.
+enum ConnectionState {
+    /// Normal operation, commands are executed immediately.
+    Normal,
+    /// Inside a MULTI...EXEC block. Commands are queued.
+    InTransaction,
+}
 
 /// The entry point for handling a single client connection.
 pub async fn handle_connection(
@@ -26,12 +33,31 @@ pub async fn handle_connection(
     waiters: Arc<WaiterRegistry>,
 ) {
     let mut framed = Framed::new(stream, RespDecoder);
+    let mut state = ConnectionState::Normal;
+    let mut command_queue: Vec<ParsedCommand> = Vec::new();
 
     loop {
         match framed.next().await {
             Some(Ok(value)) => {
                 debug!("received RESP value: {value:?}");
-                let response = handle_command(value, &store, &waiters).await;
+                let parsed_command = match ParsedCommand::from_resp(value) {
+                    Ok(cmd) => cmd,
+                    Err(e) => {
+                        if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
+                            error!("failed to send error response: {e}");
+                        }
+                        continue;
+                    }
+                };
+                
+                let response = handle_command(
+                    parsed_command,
+                    &store,
+                    &waiters,
+                    &mut state,
+                    &mut command_queue,
+                ).await;
+
                 if let Err(e) = framed.send(response).await {
                     error!("failed to send response: {e}");
                     return;
@@ -46,33 +72,84 @@ pub async fn handle_connection(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_command(
-    value: RespValue,
-    store: &Store,
-    waiters: &WaiterRegistry,
+    parsed: ParsedCommand,
+    store: &Arc<Store>,
+    waiters: &Arc<WaiterRegistry>,
+    state: &mut ConnectionState,
+    queue: &mut Vec<ParsedCommand>,
 ) -> RespValue {
-    let parsed_command = match ParsedCommand::from_resp(value) {
-        Ok(cmd) => cmd,
-        Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
-    };
+    // Handle transaction commands, which can change the connection state.
+    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters).await {
+        return response;
+    }
+    
+    // If in a transaction, queue the command.
+    if matches!(state, ConnectionState::InTransaction) {
+        queue.push(parsed);
+        return RespValue::SimpleString(Bytes::from_static(b"QUEUED"));
+    }
 
-    debug!("parsed command: {parsed_command:?}");
-
-    match parsed_command.command() {
+    // In normal state, execute the command immediately.
+    match parsed.command() {
         Command::Ping => RespValue::SimpleString(Bytes::from_static(b"PONG")),
-        Command::Echo => handle_echo(parsed_command),
-        Command::Set => handle_set(parsed_command, store),
-        Command::Get => handle_get(parsed_command, store),
-        Command::LPush => handle_push(parsed_command, store, waiters, true),
-        Command::RPush => handle_push(parsed_command, store, waiters, false),
-        Command::LPop => handle_lpop(parsed_command, store),
-        Command::LLen => handle_llen(parsed_command, store),
-        Command::LRange => handle_lrange(parsed_command, store),
-        Command::BLPop => handle_blpop(parsed_command, store, waiters).await,
+        Command::Echo => handle_echo(parsed),
+        Command::Set => handle_set(parsed, store),
+        Command::Get => handle_get(parsed, store),
+        Command::Incr => handle_incr(parsed, store),
+        Command::LPush => handle_push(parsed, store, waiters, true),
+        Command::RPush => handle_push(parsed, store, waiters, false),
+        Command::LPop => handle_lpop(parsed, store),
+        Command::LLen => handle_llen(parsed, store),
+        Command::LRange => handle_lrange(parsed, store),
+        Command::BLPop => handle_blpop(parsed, store, waiters).await,
         _ => RespValue::Error(Bytes::from(format!(
             "ERR unknown command '{}'",
-            parsed_command.command()
+            parsed.command()
         ))),
+    }
+}
+
+/// Handles transaction commands (`MULTI`, `EXEC`, `DISCARD`) and manages state transitions.
+/// Returns `Some(response)` if it handled the command, or `None` if it's a regular command.
+async fn handle_transaction_state(
+    parsed: ParsedCommand,
+    state: &mut ConnectionState,
+    queue: &mut Vec<ParsedCommand>,
+    store: &Arc<Store>,
+    waiters: &Arc<WaiterRegistry>,
+) -> Option<RespValue> {
+    match parsed.command() {
+        Command::Multi => {
+            if matches!(state, ConnectionState::InTransaction) {
+                return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
+            }
+            *state = ConnectionState::InTransaction;
+            queue.clear();
+            Some(RespValue::SimpleString(Bytes::from_static(b"OK")))
+        }
+        Command::Exec => {
+            if !matches!(state, ConnectionState::InTransaction) {
+                return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
+            }
+            *state = ConnectionState::Normal;
+            let mut responses = Vec::with_capacity(queue.len());
+            for cmd in std::mem::take(queue) {
+                let response = Box::pin(handle_command(cmd, store, waiters, &mut ConnectionState::Normal, &mut vec![])).await;
+                responses.push(response);
+            }
+            Some(RespValue::Array(responses))
+        }
+        Command::Discard => {
+            if !matches!(state, ConnectionState::InTransaction) {
+                return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
+            }
+            *state = ConnectionState::Normal;
+            queue.clear();
+            Some(RespValue::SimpleString(Bytes::from_static(b"OK")))
+        }
+        _ => None,
     }
 }
 
@@ -131,6 +208,16 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
     }
 }
 
+fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
+    let Some(key) = parsed.arg(0) else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'incr' command"));
+    };
+    match store.incr(key) {
+        Ok(new_value) => RespValue::Integer(new_value),
+        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    }
+}
+
 fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, left: bool) -> RespValue {
     let Some(key) = parsed.arg(0) else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
@@ -148,7 +235,9 @@ fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, l
 
     match new_len {
         Ok(len) => {
-            waiters.notify_one(key);
+            if len > 0 { // Only notify if a list was actually modified
+                waiters.notify_one(key);
+            }
             RespValue::Integer(len as i64)
         }
         Err(e) => RespValue::Error(Bytes::from(e.to_string())),
@@ -216,8 +305,7 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     }
     
-    // This can happen in a race condition if another client pops the value
-    // between when we were notified and when we tried to pop.
+    warn!("BLPOP notified for key '{:?}' but no value was available to pop", String::from_utf8_lossy(&key));
     RespValue::NullBulkString
 }
 
