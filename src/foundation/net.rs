@@ -6,7 +6,7 @@ use tracing::info;
 
 /// Runs the main server loop.
 ///
-/// Listens for incoming TCP connections and spawns a new task for each one, 
+/// Listens for incoming TCP connections and spawns a new task for each one,
 /// passing the stream to the provided `connection_handler` function.
 pub async fn run<F, Fut>(
     listener: TcpListener,

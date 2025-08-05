@@ -1,20 +1,20 @@
 use crate::app::error::{AppError, WRONGTYPE_ERROR};
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 /// Represents the different data types that can be stored.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DataType {
     String(Bytes),
     List(VecDeque<Bytes>),
 }
 
-#[derive(Debug)]
-struct StoreValue {
-    data: DataType,
-    expires_at: Option<Instant>,
+#[derive(Debug, Clone)]
+pub struct StoreValue {
+    pub data: DataType,
+    pub expires_at: Option<Instant>,
 }
 
 /// A thread-safe, in-memory key-value store using DashMap for high concurrency.
@@ -26,6 +26,22 @@ pub struct Store {
 impl Store {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hydrates the store from data parsed from an RDB file.
+    pub fn load_from_rdb(&self, rdb_store: HashMap<Bytes, StoreValue>) {
+        for (key, value) in rdb_store {
+            self.data.insert(key, value);
+        }
+    }
+
+    /// Returns all non-expired keys.
+    pub fn get_all_keys(&self) -> Vec<Bytes> {
+        self.data
+            .iter()
+            .filter(|entry| !Self::is_expired(entry.value()))
+            .map(|entry| entry.key().clone())
+            .collect()
     }
 
     // --- String Commands ---
@@ -47,7 +63,12 @@ impl Store {
         }
     }
 
-    pub fn set_string(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) -> Result<(), AppError> {
+    pub fn set_string(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        expiry: Option<Duration>,
+    ) -> Result<(), AppError> {
         if let Some(mut entry) = self.data.get_mut(&key) {
             if !matches!(entry.data, DataType::String(_)) {
                 return Err(WRONGTYPE_ERROR);
@@ -81,7 +102,7 @@ impl Store {
                     .ok_or(AppError::ValueError(
                         "value is not an integer or out of range".into(),
                     ))?;
-                
+
                 let new_val = current_val + 1;
                 *bytes = Bytes::from(new_val.to_string());
                 Ok(new_val)
@@ -91,7 +112,7 @@ impl Store {
     }
 
     // --- List Commands ---
-
+    // ... (unchanged from previous phase)
     pub fn lpush(&self, key: Bytes, values: &[Bytes]) -> Result<usize, AppError> {
         let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
             data: DataType::List(VecDeque::new()),
@@ -212,7 +233,7 @@ impl Store {
     fn is_expired(value: &StoreValue) -> bool {
         matches!(value.expires_at, Some(t) if Instant::now() > t)
     }
-    
+
     fn normalize_index(index: i64, len: i64) -> usize {
         if index >= 0 {
             index as usize

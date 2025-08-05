@@ -69,7 +69,9 @@ impl ParsedCommand {
                 let args = iter
                     .map(|val| match val {
                         RespValue::BulkString(bytes) => Ok(bytes),
-                        _ => Err(AppError::ParseError("Argument must be a bulk string".into())),
+                        _ => Err(AppError::ParseError(
+                            "Argument must be a bulk string".into(),
+                        )),
                     })
                     .collect::<Result<Vec<Bytes>, _>>()?;
 

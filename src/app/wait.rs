@@ -39,7 +39,10 @@ impl WaiterRegistry {
         let notify = Arc::new(Notify::new());
 
         for key in keys {
-            self.waiters.entry(key.clone()).or_default().push_back(Arc::clone(&notify));
+            self.waiters
+                .entry(key.clone())
+                .or_default()
+                .push_back(Arc::clone(&notify));
         }
 
         let notified_future = async {
@@ -49,14 +52,14 @@ impl WaiterRegistry {
             // is to just return the first key we were waiting on. This is a slight simplification
             // but works for the test cases. A more robust implementation would
             // pass the key through the notification channel.
-            keys.get(0).cloned()
+            keys.first().cloned()
         };
 
         if let Some(duration) = timeout {
             match time::timeout(duration, notified_future).await {
                 Ok(Some(key)) => Some(key),
                 Ok(None) => None, // Should not happen if keys is not empty
-                Err(_) => None, // Timeout elapsed
+                Err(_) => None,   // Timeout elapsed
             }
         } else {
             // Wait indefinitely

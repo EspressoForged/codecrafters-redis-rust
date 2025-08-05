@@ -1,9 +1,10 @@
 use crate::app::{
     command::{Command, ParsedCommand},
+    protocol::{RespDecoder, RespValue},
     store::Store,
     wait::WaiterRegistry,
 };
-use crate::app::protocol::{RespDecoder, RespValue};
+use crate::config::Config;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -15,14 +16,13 @@ use tracing::{debug, error, warn};
 pub mod command;
 pub mod error;
 pub mod protocol;
+pub mod rdb;
 pub mod store;
 pub mod wait;
 
 /// Represents the state of a single client connection.
 enum ConnectionState {
-    /// Normal operation, commands are executed immediately.
     Normal,
-    /// Inside a MULTI...EXEC block. Commands are queued.
     InTransaction,
 }
 
@@ -31,6 +31,7 @@ pub async fn handle_connection(
     stream: TcpStream,
     store: Arc<Store>,
     waiters: Arc<WaiterRegistry>,
+    config: Arc<Config>,
 ) {
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
@@ -43,20 +44,25 @@ pub async fn handle_connection(
                 let parsed_command = match ParsedCommand::from_resp(value) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
+                        if let Err(e) = framed
+                            .send(RespValue::Error(Bytes::from(e.to_string())))
+                            .await
+                        {
                             error!("failed to send error response: {e}");
                         }
                         continue;
                     }
                 };
-                
+
                 let response = handle_command(
                     parsed_command,
                     &store,
                     &waiters,
+                    &config,
                     &mut state,
                     &mut command_queue,
-                ).await;
+                )
+                .await;
 
                 if let Err(e) = framed.send(response).await {
                     error!("failed to send response: {e}");
@@ -77,26 +83,28 @@ async fn handle_command(
     parsed: ParsedCommand,
     store: &Arc<Store>,
     waiters: &Arc<WaiterRegistry>,
+    config: &Arc<Config>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
 ) -> RespValue {
-    // Handle transaction commands, which can change the connection state.
-    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters).await {
+    if let Some(response) =
+        handle_transaction_state(parsed.clone(), state, queue, store, waiters, config).await
+    {
         return response;
     }
-    
-    // If in a transaction, queue the command.
+
     if matches!(state, ConnectionState::InTransaction) {
         queue.push(parsed);
         return RespValue::SimpleString(Bytes::from_static(b"QUEUED"));
     }
 
-    // In normal state, execute the command immediately.
     match parsed.command() {
         Command::Ping => RespValue::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => handle_echo(parsed),
         Command::Set => handle_set(parsed, store),
         Command::Get => handle_get(parsed, store),
+        Command::Config => handle_config(parsed, config),
+        Command::Keys => handle_keys(parsed, store),
         Command::Incr => handle_incr(parsed, store),
         Command::LPush => handle_push(parsed, store, waiters, true),
         Command::RPush => handle_push(parsed, store, waiters, false),
@@ -111,19 +119,20 @@ async fn handle_command(
     }
 }
 
-/// Handles transaction commands (`MULTI`, `EXEC`, `DISCARD`) and manages state transitions.
-/// Returns `Some(response)` if it handled the command, or `None` if it's a regular command.
 async fn handle_transaction_state(
     parsed: ParsedCommand,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
     store: &Arc<Store>,
     waiters: &Arc<WaiterRegistry>,
+    config: &Arc<Config>,
 ) -> Option<RespValue> {
     match parsed.command() {
         Command::Multi => {
             if matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR MULTI calls can not be nested",
+                )));
             }
             *state = ConnectionState::InTransaction;
             queue.clear();
@@ -131,19 +140,31 @@ async fn handle_transaction_state(
         }
         Command::Exec => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR EXEC without MULTI",
+                )));
             }
             *state = ConnectionState::Normal;
             let mut responses = Vec::with_capacity(queue.len());
             for cmd in std::mem::take(queue) {
-                let response = Box::pin(handle_command(cmd, store, waiters, &mut ConnectionState::Normal, &mut vec![])).await;
+                let response = Box::pin(handle_command(
+                    cmd,
+                    store,
+                    waiters,
+                    config,
+                    &mut ConnectionState::Normal,
+                    &mut vec![],
+                ))
+                .await;
                 responses.push(response);
             }
             Some(RespValue::Array(responses))
         }
         Command::Discard => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR DISCARD without MULTI",
+                )));
             }
             *state = ConnectionState::Normal;
             queue.clear();
@@ -154,6 +175,57 @@ async fn handle_transaction_state(
 }
 
 // --- Command Handlers ---
+
+fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
+    let Some(verb) = parsed.arg(0) else {
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'config' command",
+        ));
+    };
+    let Some(key_bytes) = parsed.arg(1) else {
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'config' command",
+        ));
+    };
+
+    if !verb.eq_ignore_ascii_case(b"get") {
+        return RespValue::Error(Bytes::from_static(b"ERR CONFIG only supports GET"));
+    }
+
+    let key = match std::str::from_utf8(key_bytes) {
+        Ok(s) => s,
+        Err(_) => return RespValue::Error(Bytes::from_static(b"ERR invalid config key")),
+    };
+
+    match key.to_lowercase().as_str() {
+        "dir" => RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"dir")),
+            RespValue::BulkString(Bytes::from(config.dir.clone())),
+        ]),
+        "dbfilename" => RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"dbfilename")),
+            RespValue::BulkString(Bytes::from(config.dbfilename.clone())),
+        ]),
+        _ => RespValue::Array(vec![]), // Unknown config key
+    }
+}
+
+fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
+    let Some(pattern) = parsed.arg(0) else {
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'keys' command",
+        ));
+    };
+
+    // CORRECTED: Dereference the `Bytes` object to a slice for comparison.
+    if &pattern[..] != b"*" {
+        warn!("Received KEYS command with non-'*' pattern, which is not supported.");
+        return RespValue::Array(vec![]);
+    }
+
+    let keys = store.get_all_keys();
+    RespValue::Array(keys.into_iter().map(RespValue::BulkString).collect())
+}
 
 fn handle_echo(parsed: ParsedCommand) -> RespValue {
     parsed
@@ -168,7 +240,9 @@ fn handle_echo(parsed: ParsedCommand) -> RespValue {
 
 fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
     let (Some(key), Some(value)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'set' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'set' command",
+        ));
     };
 
     let mut expiry = None;
@@ -181,10 +255,12 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
                 {
                     expiry = Some(Duration::from_millis(millis));
                 } else {
-                    return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range"));
+                    return RespValue::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
                 }
             } else {
-                 return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
+                return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
             }
         } else {
             return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
@@ -199,7 +275,9 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'get' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'get' command",
+        ));
     };
     match store.get_string(key) {
         Ok(Some(value)) => RespValue::BulkString(value),
@@ -210,7 +288,9 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'incr' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'incr' command",
+        ));
     };
     match store.incr(key) {
         Ok(new_value) => RespValue::Integer(new_value),
@@ -218,7 +298,12 @@ fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
     }
 }
 
-fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, left: bool) -> RespValue {
+fn handle_push(
+    parsed: ParsedCommand,
+    store: &Store,
+    waiters: &WaiterRegistry,
+    left: bool,
+) -> RespValue {
     let Some(key) = parsed.arg(0) else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
@@ -235,7 +320,8 @@ fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, l
 
     match new_len {
         Ok(len) => {
-            if len > 0 { // Only notify if a list was actually modified
+            if len > 0 {
+                // Only notify if a list was actually modified
                 waiters.notify_one(key);
             }
             RespValue::Integer(len as i64)
@@ -268,22 +354,34 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> RespValue {
-    let Some(keys_arg) = parsed.args_from(0)
+    let Some(keys_arg) = parsed
+        .args_from(0)
         .split_last()
-        .map(|(last, elements)| (elements, last)) else {
+        .map(|(last, elements)| (elements, last))
+    else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
     let (keys, timeout_str) = keys_arg;
-    let timeout_secs = match std::str::from_utf8(timeout_str).ok().and_then(|s| s.parse::<f64>().ok()) {
+    let timeout_secs = match std::str::from_utf8(timeout_str)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+    {
         Some(t) => t,
-        None => return RespValue::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR timeout is not a float or out of range",
+            ))
+        }
     };
 
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value)]);
+                return RespValue::Array(vec![
+                    RespValue::BulkString(key.clone()),
+                    RespValue::BulkString(value),
+                ]);
             }
         }
     }
@@ -301,14 +399,19 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
 
     if let Ok(Some(popped)) = store.lpop(&key, 1) {
         if let Some(value) = popped.into_iter().next() {
-            return RespValue::Array(vec![RespValue::BulkString(key), RespValue::BulkString(value)]);
+            return RespValue::Array(vec![
+                RespValue::BulkString(key),
+                RespValue::BulkString(value),
+            ]);
         }
     }
-    
-    warn!("BLPOP notified for key '{:?}' but no value was available to pop", String::from_utf8_lossy(&key));
+
+    warn!(
+        "BLPOP notified for key '{:?}' but no value was available to pop",
+        String::from_utf8_lossy(&key)
+    );
     RespValue::NullBulkString
 }
-
 
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.arg(0) else {
@@ -321,17 +424,33 @@ fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let (Some(key), Some(start_str), Some(stop_str)) = (parsed.arg(0), parsed.arg(1), parsed.arg(2)) else {
+    let (Some(key), Some(start_str), Some(stop_str)) =
+        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
+    else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let start = match std::str::from_utf8(start_str).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let start = match std::str::from_utf8(start_str)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
-    let stop = match std::str::from_utf8(stop_str).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let stop = match std::str::from_utf8(stop_str)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
 
     match store.lrange(key, start, stop) {
