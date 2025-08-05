@@ -20,13 +20,11 @@ pub mod rdb;
 pub mod store;
 pub mod wait;
 
-/// Represents the state of a single client connection.
 enum ConnectionState {
     Normal,
     InTransaction,
 }
 
-/// The entry point for handling a single client connection.
 pub async fn handle_connection(
     stream: TcpStream,
     store: Arc<Store>,
@@ -73,7 +71,7 @@ pub async fn handle_connection(
                 error!("error reading from stream: {e}");
                 return;
             }
-            None => return, // Stream closed
+            None => return,
         }
     }
 }
@@ -174,8 +172,6 @@ async fn handle_transaction_state(
     }
 }
 
-// --- Command Handlers ---
-
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
     let Some(verb) = parsed.arg(0) else {
         return RespValue::Error(Bytes::from_static(
@@ -206,7 +202,7 @@ fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
             RespValue::BulkString(Bytes::from_static(b"dbfilename")),
             RespValue::BulkString(Bytes::from(config.dbfilename.clone())),
         ]),
-        _ => RespValue::Array(vec![]), // Unknown config key
+        _ => RespValue::Array(vec![]),
     }
 }
 
@@ -217,7 +213,6 @@ fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
         ));
     };
 
-    // CORRECTED: Dereference the `Bytes` object to a slice for comparison.
     if &pattern[..] != b"*" {
         warn!("Received KEYS command with non-'*' pattern, which is not supported.");
         return RespValue::Array(vec![]);
@@ -320,8 +315,8 @@ fn handle_push(
 
     match new_len {
         Ok(len) => {
+            // Notify a waiting client *after* successfully pushing.
             if len > 0 {
-                // Only notify if a list was actually modified
                 waiters.notify_one(key);
             }
             RespValue::Integer(len as i64)
@@ -375,6 +370,7 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     };
 
+    // First, try a non-blocking pop on all keys. This is the race-free way.
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
@@ -392,24 +388,23 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         Some(Duration::from_secs_f64(timeout_secs))
     };
 
-    let key = match waiters.wait_for_any(keys, timeout).await {
-        Some(key) => key,
-        None => return RespValue::NullBulkString,
-    };
+    // If all lists are empty, block and wait for a notification.
+    waiters.wait_for_any(keys, timeout).await;
 
-    if let Ok(Some(popped)) = store.lpop(&key, 1) {
-        if let Some(value) = popped.into_iter().next() {
-            return RespValue::Array(vec![
-                RespValue::BulkString(key),
-                RespValue::BulkString(value),
-            ]);
+    // After being woken up or timing out, we try to pop again.
+    // This re-check is what prevents the race condition.
+    for key in keys {
+        if let Ok(Some(popped)) = store.lpop(key, 1) {
+            if let Some(value) = popped.into_iter().next() {
+                return RespValue::Array(vec![
+                    RespValue::BulkString(key.clone()),
+                    RespValue::BulkString(value),
+                ]);
+            }
         }
     }
 
-    warn!(
-        "BLPOP notified for key '{:?}' but no value was available to pop",
-        String::from_utf8_lossy(&key)
-    );
+    // If we're here, we were either woken up and another client got the value first, or we timed out.
     RespValue::NullBulkString
 }
 
