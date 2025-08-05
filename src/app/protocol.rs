@@ -2,10 +2,9 @@ use crate::app::error::AppError;
 use bytes::{Buf, Bytes, BytesMut};
 use nom::{
     branch::alt,
-    bytes::complete::{tag, take},
+    bytes::complete::{tag, take, take_until},
     character::complete::{crlf, digit1},
     combinator::{map, map_res},
-    multi::length_count,
     sequence::{preceded, terminated},
     IResult,
 };
@@ -32,6 +31,9 @@ impl Decoder for RespDecoder {
     type Error = AppError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.is_empty() {
+            return Ok(None);
+        }
         match parse_message(src) {
             Ok((remaining, value)) => {
                 let consumed = src.len() - remaining.len();
@@ -57,14 +59,14 @@ fn parse_message(input: &[u8]) -> IResult<&[u8], RespValue> {
 
 fn parse_simple_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(tag("+"), terminated(take_until_crlf, crlf)),
+        preceded(tag("+"), terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::SimpleString(Bytes::copy_from_slice(s)),
     )(input)
 }
 
 fn parse_error(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(tag("-"), terminated(take_until_crlf, crlf)),
+        preceded(tag("-"), terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::Error(Bytes::copy_from_slice(s)),
     )(input)
 }
@@ -80,7 +82,7 @@ fn parse_integer(input: &[u8]) -> IResult<&[u8], RespValue> {
 }
 
 fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
-    let (input, len_str) = preceded(tag("$"), terminated(take_until_crlf, crlf))(input)?;
+    let (input, len_str) = preceded(tag("$"), terminated(take_until("\r\n"), crlf))(input)?;
     let len: i64 = std::str::from_utf8(len_str).unwrap().parse().unwrap();
 
     if len == -1 {
@@ -92,29 +94,15 @@ fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
 }
 
 fn parse_array(input: &[u8]) -> IResult<&[u8], RespValue> {
-    map(
-        preceded(
-            tag("*"),
-            length_count(
-                map_res(terminated(digit1, crlf), |s: &[u8]| {
-                    std::str::from_utf8(s).unwrap().parse::<usize>()
-                }),
-                parse_message,
-            ),
-        ),
-        RespValue::Array,
-    )(input)
-}
-
-fn take_until_crlf(input: &[u8]) -> IResult<&[u8], &[u8]> {
-    let mut i = 0;
-    while i + 1 < input.len() {
-        if input[i] == b'\r' && input[i + 1] == b'\n' {
-            return Ok((&input[i..], &input[0..i]));
-        }
-        i += 1;
+    let (input, count_str) = preceded(tag("*"), terminated(take_until("\r\n"), crlf))(input)?;
+    let count: i64 = std::str::from_utf8(count_str).unwrap().parse().unwrap();
+    
+    if count == -1 {
+        return Ok((input, RespValue::Array(vec![])));
     }
-    Err(nom::Err::Incomplete(nom::Needed::new(1)))
+
+    let (input, items) = nom::multi::count(parse_message, count as usize)(input)?;
+    Ok((input, RespValue::Array(items)))
 }
 
 //--- Encoder (Serializer) ---
