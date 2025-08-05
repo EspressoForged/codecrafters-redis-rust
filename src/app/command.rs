@@ -3,6 +3,11 @@ use bytes::Bytes;
 use std::str::FromStr;
 use strum_macros::{Display, EnumString};
 
+/// Represents the set of commands the Redis server understands.
+///
+/// Using `strum` to derive `EnumString` allows for easy, case-insensitive
+/// parsing from a string slice into a `Command` variant. `Display` allows
+/// for easy conversion back to a string for logging.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Display, EnumString)]
 #[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]
 pub enum Command {
@@ -34,7 +39,6 @@ pub enum Command {
     Publish,
     Unsubscribe,
 }
-
 
 /// Represents a command parsed from a RESP message, including its arguments.
 #[derive(Debug)]
@@ -81,5 +85,14 @@ impl ParsedCommand {
 
     pub fn arg(&self, index: usize) -> Option<&Bytes> {
         self.args.get(index)
+    }
+
+    /// Returns a slice of all arguments starting from a given index.
+    pub fn args_from(&self, start_index: usize) -> &[Bytes] {
+        if start_index >= self.args.len() {
+            &[]
+        } else {
+            &self.args[start_index..]
+        }
     }
 }

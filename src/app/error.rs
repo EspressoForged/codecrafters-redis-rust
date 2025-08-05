@@ -19,4 +19,8 @@ pub enum AppError {
     /// The `#[from]` attribute automatically implements `From<std::io::Error>` for us.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Operation against a key holding the wrong kind of value.
+    #[error("WRONGTYPE Operation against a key holding the wrong kind of value")]
+    WrongType,
 }

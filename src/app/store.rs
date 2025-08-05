@@ -1,10 +1,21 @@
+use crate::app::error::AppError;
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+
+pub const WRONGTYPE_ERROR: AppError = AppError::WrongType;
+
+/// Represents the different data types that can be stored.
+#[derive(Debug)]
+pub enum DataType {
+    String(Bytes),
+    List(VecDeque<Bytes>),
+}
 
 #[derive(Debug)]
 struct StoreValue {
-    data: Bytes,
+    data: DataType,
     expires_at: Option<Instant>,
 }
 
@@ -15,43 +26,159 @@ pub struct Store {
 }
 
 impl Store {
-    /// Creates a new, empty `Store`.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Sets a key to a value with an optional expiry.
-    ///
-    /// The `DashMap::insert` method handles locking internally.
-    pub fn set(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) {
-        let expires_at = expiry.and_then(|d| Instant::now().checked_add(d));
+    // --- String Commands ---
 
-        let value = StoreValue {
-            data: value,
-            expires_at,
-        };
-
-        self.data.insert(key, value);
+    pub fn get_string(&self, key: &Bytes) -> Result<Option<Bytes>, AppError> {
+        let entry = self.data.get(key);
+        if let Some(value) = entry {
+            if Self::is_expired(&value) {
+                return Ok(None);
+            }
+            match &value.data {
+                DataType::String(s) => Ok(Some(s.clone())),
+                _ => Err(WRONGTYPE_ERROR),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
-    /// Gets the value for a key.
-    ///
-    /// Returns `None` if the key does not exist or has expired.
-    pub fn get(&self, key: &Bytes) -> Option<Bytes> {
-        // `DashMap::get` returns a `Ref`, a smart pointer that holds a read lock
-        // for a specific shard. The lock is released when `value` goes out of scope.
-        if let Some(value) = self.data.get(key) {
-            if let Some(expires_at) = value.expires_at {
-                if Instant::now() > expires_at {
-                    // To be fully correct, we should also remove the key here,
-                    // but for simplicity, we'll rely on "get" to filter expired keys.
-                    // A background task could handle active cleanup.
-                    return None;
+    pub fn set_string(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) -> Result<(), AppError> {
+        let expires_at = expiry.and_then(|d| Instant::now().checked_add(d));
+        let value = StoreValue {
+            data: DataType::String(value),
+            expires_at,
+        };
+        self.data.insert(key, value);
+        Ok(())
+    }
+
+    // --- List Commands ---
+
+    pub fn lpush(&self, key: Bytes, values: &[Bytes]) -> Result<usize, AppError> {
+        let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
+            data: DataType::List(VecDeque::new()),
+            expires_at: None,
+        });
+
+        match &mut entry.value_mut().data {
+            DataType::List(list) => {
+                for value in values.iter().rev() {
+                    list.push_front(value.clone());
                 }
+                Ok(list.len())
             }
-            // We clone the `Bytes` object, which is cheap (it's a reference-counted pointer).
-            return Some(value.data.clone());
+            _ => Err(WRONGTYPE_ERROR),
         }
-        None
+    }
+
+    pub fn rpush(&self, key: Bytes, values: &[Bytes]) -> Result<usize, AppError> {
+        let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
+            data: DataType::List(VecDeque::new()),
+            expires_at: None,
+        });
+
+        match &mut entry.value_mut().data {
+            DataType::List(list) => {
+                for value in values {
+                    list.push_back(value.clone());
+                }
+                Ok(list.len())
+            }
+            _ => Err(WRONGTYPE_ERROR),
+        }
+    }
+
+    pub fn lpop(&self, key: &Bytes, count: usize) -> Result<Option<Vec<Bytes>>, AppError> {
+        let mut entry = match self.data.get_mut(key) {
+            Some(entry) => entry,
+            None => return Ok(None),
+        };
+
+        if Self::is_expired(&entry) {
+            return Ok(None);
+        }
+
+        match &mut entry.value_mut().data {
+            DataType::List(list) => {
+                if list.is_empty() {
+                    return Ok(None);
+                }
+                let mut popped = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if let Some(val) = list.pop_front() {
+                        popped.push(val);
+                    } else {
+                        break;
+                    }
+                }
+                Ok(Some(popped))
+            }
+            _ => Err(WRONGTYPE_ERROR),
+        }
+    }
+
+    pub fn llen(&self, key: &Bytes) -> Result<usize, AppError> {
+        let entry = self.data.get(key);
+        if let Some(value) = entry {
+            if Self::is_expired(&value) {
+                return Ok(0);
+            }
+            match &value.data {
+                DataType::List(list) => Ok(list.len()),
+                _ => Err(WRONGTYPE_ERROR),
+            }
+        } else {
+            Ok(0)
+        }
+    }
+
+    pub fn lrange(&self, key: &Bytes, start: i64, stop: i64) -> Result<Vec<Bytes>, AppError> {
+        let entry = self.data.get(key);
+        if let Some(value) = entry {
+            if Self::is_expired(&value) {
+                return Ok(vec![]);
+            }
+            match &value.data {
+                DataType::List(list) => {
+                    let len = list.len() as i64;
+                    let start = Self::normalize_index(start, len);
+                    let stop = Self::normalize_index(stop, len);
+
+                    if start > stop || start >= (len as usize) {
+                        return Ok(Vec::new());
+                    }
+
+                    let items = list
+                        .iter()
+                        .skip(start)
+                        .take(stop - start + 1)
+                        .cloned()
+                        .collect();
+                    Ok(items)
+                }
+                _ => Err(WRONGTYPE_ERROR),
+            }
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    // --- Helper Functions ---
+
+    fn is_expired(value: &StoreValue) -> bool {
+        matches!(value.expires_at, Some(t) if Instant::now() > t)
+    }
+    
+    fn normalize_index(index: i64, len: i64) -> usize {
+        if index >= 0 {
+            index as usize
+        } else {
+            (len + index).max(0) as usize
+        }
     }
 }

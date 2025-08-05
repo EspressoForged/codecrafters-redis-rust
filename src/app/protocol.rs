@@ -1,12 +1,7 @@
 use crate::app::error::AppError;
 use bytes::{Buf, Bytes, BytesMut};
 use nom::{
-    branch::alt,
-    bytes::complete::{tag, take, take_until},
-    character::complete::{crlf, digit1},
-    combinator::{map, map_res},
-    sequence::{preceded, terminated},
-    IResult,
+    branch::alt, bytes::complete::{tag, take, take_until}, character::complete::{crlf, digit1}, combinator::{map, map_res}, sequence::preceded, IResult
 };
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -59,14 +54,14 @@ fn parse_message(input: &[u8]) -> IResult<&[u8], RespValue> {
 
 fn parse_simple_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(tag("+"), terminated(take_until("\r\n"), crlf)),
+        preceded(tag("+"), nom::sequence::terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::SimpleString(Bytes::copy_from_slice(s)),
     )(input)
 }
 
 fn parse_error(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(tag("-"), terminated(take_until("\r\n"), crlf)),
+        preceded(tag("-"), nom::sequence::terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::Error(Bytes::copy_from_slice(s)),
     )(input)
 }
@@ -75,26 +70,26 @@ fn parse_integer(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
         preceded(
             tag(":"),
-            terminated(map_res(digit1, |s: &[u8]| std::str::from_utf8(s).unwrap().parse::<i64>()), crlf),
+            nom::sequence::terminated(map_res(digit1, |s: &[u8]| std::str::from_utf8(s).unwrap().parse::<i64>()), crlf),
         ),
         RespValue::Integer,
     )(input)
 }
 
 fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
-    let (input, len_str) = preceded(tag("$"), terminated(take_until("\r\n"), crlf))(input)?;
+    let (input, len_str) = preceded(tag("$"), nom::sequence::terminated(take_until("\r\n"), crlf))(input)?;
     let len: i64 = std::str::from_utf8(len_str).unwrap().parse().unwrap();
 
     if len == -1 {
         return Ok((input, RespValue::NullBulkString));
     }
 
-    let (input, content) = terminated(take(len as usize), crlf)(input)?;
+    let (input, content) = nom::sequence::terminated(take(len as usize), crlf)(input)?;
     Ok((input, RespValue::BulkString(Bytes::copy_from_slice(content))))
 }
 
 fn parse_array(input: &[u8]) -> IResult<&[u8], RespValue> {
-    let (input, count_str) = preceded(tag("*"), terminated(take_until("\r\n"), crlf))(input)?;
+    let (input, count_str) = preceded(tag("*"), nom::sequence::terminated(take_until("\r\n"), crlf))(input)?;
     let count: i64 = std::str::from_utf8(count_str).unwrap().parse().unwrap();
     
     if count == -1 {
@@ -122,6 +117,11 @@ impl Encoder<RespValue> for RespDecoder {
                 dst.extend_from_slice(&s);
                 dst.extend_from_slice(b"\r\n");
             }
+            RespValue::Integer(i) => {
+                dst.extend_from_slice(b":");
+                dst.extend_from_slice(i.to_string().as_bytes());
+                dst.extend_from_slice(b"\r\n");
+            }
             RespValue::BulkString(s) => {
                 dst.extend_from_slice(b"$");
                 dst.extend_from_slice(s.len().to_string().as_bytes());
@@ -132,8 +132,14 @@ impl Encoder<RespValue> for RespDecoder {
             RespValue::NullBulkString => {
                 dst.extend_from_slice(b"$-1\r\n");
             }
-            // Other types are not sent by the server in this phase.
-            _ => return Err(AppError::ParseError("Cannot encode this RESP type".into())),
+            RespValue::Array(items) => {
+                dst.extend_from_slice(b"*");
+                dst.extend_from_slice(items.len().to_string().as_bytes());
+                dst.extend_from_slice(b"\r\n");
+                for item in items {
+                    self.encode(item, dst)?;
+                }
+            }
         }
         Ok(())
     }

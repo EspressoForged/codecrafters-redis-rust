@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use codecrafters_redis::{
     app,
-    app::store::Store,
+    app::{store::Store, wait::WaiterRegistry}, // <-- Import WaiterRegistry
     config::Config,
     foundation::{net, shutdown},
     logging,
@@ -23,8 +23,8 @@ async fn main() -> Result<()> {
         config.listen_addr()
     );
 
-    // Create the shared, thread-safe data store.
     let store = Arc::new(Store::new());
+    let waiters = Arc::new(WaiterRegistry::new()); // <-- Create the waiter registry
 
     let listener = TcpListener::bind(config.listen_addr()).await?;
 
@@ -34,11 +34,14 @@ async fn main() -> Result<()> {
             .expect("failed to install CTRL+C signal handler");
     };
 
+    // The connection handler now gets clones of both the store and the waiter registry.
     let connection_handler = {
         let store = Arc::clone(&store);
+        let waiters = Arc::clone(&waiters);
         move |stream| {
             let store = Arc::clone(&store);
-            app::handle_connection(stream, store)
+            let waiters = Arc::clone(&waiters);
+            app::handle_connection(stream, store, waiters)
         }
     };
 
