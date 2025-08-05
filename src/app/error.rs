@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// A constant for the WRONGTYPE error, for convenience.
+pub const WRONGTYPE_ERROR: AppError = AppError::WrongType;
+
 /// Represents errors that can occur within the application logic.
 #[derive(Error, Debug)]
 pub enum AppError {
@@ -16,7 +19,6 @@ pub enum AppError {
     UnknownCommand(String),
 
     /// An I/O error from the underlying transport.
-    /// The `#[from]` attribute automatically implements `From<std::io::Error>` for us.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

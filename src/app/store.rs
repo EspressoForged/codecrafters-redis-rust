@@ -1,10 +1,8 @@
-use crate::app::error::AppError;
+use crate::app::error::{AppError, WRONGTYPE_ERROR};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
-
-pub const WRONGTYPE_ERROR: AppError = AppError::WrongType;
 
 /// Represents the different data types that can be stored.
 #[derive(Debug)]
@@ -36,9 +34,7 @@ impl Store {
         let entry = self.data.get(key);
         if let Some(value) = entry {
             if Self::is_expired(&value) {
-                // To be fully correct, we should remove the expired key here.
-                // This requires a write lock, so we'll get the key again.
-                drop(value); // release the read lock
+                drop(value);
                 self.data.remove(key);
                 return Ok(None);
             }
@@ -52,8 +48,6 @@ impl Store {
     }
 
     pub fn set_string(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) -> Result<(), AppError> {
-        // DashMap's `entry` API is perfect here, but for simplicity with WRONGTYPE checks,
-        // we'll use a slightly more explicit get/insert.
         if let Some(mut entry) = self.data.get_mut(&key) {
             if !matches!(entry.data, DataType::String(_)) {
                 return Err(WRONGTYPE_ERROR);
@@ -84,7 +78,9 @@ impl Store {
                 let current_val = std::str::from_utf8(bytes)
                     .ok()
                     .and_then(|s| s.parse::<i64>().ok())
-                    .ok_or(AppError::ParseError("value is not an integer or out of range".into()))?;
+                    .ok_or(AppError::ValueError(
+                        "value is not an integer or out of range".into(),
+                    ))?;
                 
                 let new_val = current_val + 1;
                 *bytes = Bytes::from(new_val.to_string());
