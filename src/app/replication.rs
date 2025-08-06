@@ -4,14 +4,14 @@ use crate::app::{
     store::Store,
 };
 use anyhow::Result;
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_util::codec::Framed;
-use tracing::{debug, error, info};
+use tokio_util::codec::{Framed, FramedParts};
+use tracing::{debug, error, info, warn};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Role {
@@ -111,7 +111,7 @@ pub async fn start_replica_mode(
 async fn perform_handshake(
     stream: TcpStream,
     listening_port: u16,
-    store: Arc<Store>, // Now used to apply commands
+    store: Arc<Store>,
     _replication: Arc<ReplicationState>,
 ) -> Result<()> {
     let mut framed = Framed::new(stream, RespDecoder);
@@ -141,28 +141,37 @@ async fn perform_handshake(
     let _ = framed.next().await.unwrap()?;
 
     info!("Handshake complete. Receiving RDB file from master.");
-    
-    // Manually read and discard the RDB file before proceeding.
-    // The `Framed` object still holds the underlying stream and any buffered bytes.
-    let mut stream = framed.into_inner();
-    let mut len_buffer = [0; 10]; // Buffer for the length part, e.g., $88\r\n
-    let mut len_bytes_read = 0;
+
+    // CORRECTED: Deconstruct the Framed object to handle the RDB file manually.
+    let parts = framed.into_parts();
+    let mut stream = parts.io;
+    let mut read_buf = parts.read_buf;
+
+    // Read the length prefix (e.g., "$88\r\n")
+    let mut line_buffer = Vec::new();
     loop {
-        let byte = stream.read_u8().await?;
-        len_buffer[len_bytes_read] = byte;
-        len_bytes_read += 1;
-        if len_bytes_read > 2 && len_buffer[len_bytes_read-2] == b'\r' && len_buffer[len_bytes_read-1] == b'\n' {
+        if read_buf.is_empty() {
+            stream.read_buf(&mut read_buf).await?;
+        }
+        let byte = read_buf.get_u8();
+        line_buffer.push(byte);
+        if line_buffer.ends_with(b"\r\n") {
             break;
         }
     }
-    let len_str = std::str::from_utf8(&len_buffer[1..len_bytes_read-2])?;
+    let len_str = std::str::from_utf8(&line_buffer[1..line_buffer.len() - 2])?;
     let rdb_len = len_str.parse::<usize>()?;
+
+    // Read the RDB content itself, handling buffered data.
+    while read_buf.len() < rdb_len {
+        stream.read_buf(&mut read_buf).await?;
+    }
+    read_buf.advance(rdb_len);
     
-    let mut rdb_buffer = vec![0; rdb_len];
-    stream.read_exact(&mut rdb_buffer).await?;
-    
-    // Now that the RDB file is consumed, re-frame the stream to parse RESP commands.
-    let mut framed = Framed::new(stream, RespDecoder);
+    // Reconstruct the Framed object with any leftover bytes.
+    let mut new_parts = FramedParts::new(stream, parts.codec);
+    new_parts.read_buf = read_buf;
+    let mut framed = Framed::from_parts(new_parts);
 
     info!("RDB file consumed. Listening for propagated commands.");
 
@@ -173,17 +182,20 @@ async fn perform_handshake(
                 debug!("Replica received value from master: {value:?}");
                 let raw_bytes = value.encode_to_bytes();
                 let parsed_command = ParsedCommand::from_resp(value)?;
-                
-                // As a replica, we must now apply write commands to our own store.
+
+                // Replica must apply write commands to its own store.
                 let cmd = parsed_command.command();
                 let is_write = matches!(cmd, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
-
+                
                 if is_write {
-                    // This is a simplified dispatch. A real implementation would reuse `app/mod.rs` logic.
                     match cmd {
                         Command::Set => {
-                             let (Some(key), Some(val)) = (parsed_command.arg(0), parsed_command.arg(1)) else { continue };
-                             store.set_string(key.clone(), val.clone(), None)?;
+                             if let (Some(key), Some(val)) = (parsed_command.arg(0), parsed_command.arg(1)) {
+                                 // A real implementation would parse expiry here too.
+                                 if let Err(e) = store.set_string(key.clone(), val.clone(), None) {
+                                      warn!("Replica failed to apply SET command: {e}");
+                                 }
+                             }
                         },
                         // Other write commands would be handled here.
                         _ => {}
