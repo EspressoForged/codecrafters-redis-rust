@@ -59,6 +59,10 @@ impl Stream {
     pub fn add(&mut self, id_spec: &str, fields: Vec<(Bytes, Bytes)>) -> Result<StreamId, AppError> {
         let new_id = self.generate_id(id_spec)?;
 
+        if new_id.ms_time == 0 && new_id.seq_no == 0 {
+             return Err(AppError::ValueError("The ID specified in XADD must be greater than 0-0".into()));
+        }
+
         let last_entry_id = self.entries.last_key_value().map(|(id, _)| *id);
         
         if let Some(last_id) = last_entry_id {
@@ -67,15 +71,11 @@ impl Stream {
             }
         }
 
-        if new_id.ms_time == 0 && new_id.seq_no == 0 {
-             return Err(AppError::ValueError("The ID specified in XADD must be greater than 0-0".into()));
-        }
-
         self.entries.insert(new_id, fields);
         self.last_generated_id = new_id;
         Ok(new_id)
     }
-    
+
     /// Generates a new StreamId based on the provided spec and the stream's state.
     fn generate_id(&self, id_spec: &str) -> Result<StreamId, AppError> {
         if id_spec == "*" {
