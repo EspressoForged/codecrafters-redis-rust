@@ -26,6 +26,7 @@ pub mod pubsub;
 pub mod rdb;
 pub mod replication;
 pub mod store;
+pub mod stream;
 pub mod wait;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -135,7 +136,7 @@ pub async fn handle_command(
 
     let command = parsed.command();
 
-    let is_write_command = matches!(command, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
+    let is_write_command = matches!(command, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr | Command::XAdd);
     if is_write_command {
         if replication.role() == replication::Role::Replica {
             return RespValue::Error(Bytes::from_static(b"READONLY You can't write against a read only replica."));
@@ -146,11 +147,14 @@ pub async fn handle_command(
     match command {
         Command::Ping | Command::Echo => handlers::connection::handle(parsed),
         Command::Set | Command::Get | Command::Incr => handlers::string::handle(parsed, store),
-        Command::Config | Command::Keys => handlers::server::handle(parsed, config, store),
+        Command::Config | Command::Keys | Command::Type => handlers::server::handle(parsed, config, store),
         Command::Info | Command::ReplConf | Command::Wait => handlers::replication::handle(parsed, replication, wait_notify).await,
         Command::Publish => handlers::pubsub::publish(parsed, pubsub),
         Command::LPush | Command::RPush | Command::LPop | Command::LLen | Command::LRange | Command::BLPop => {
             handlers::list::handle(parsed, store, waiters).await
+        },
+        Command::XAdd | Command::XRange | Command::XRead => {
+            handlers::stream::handle(parsed, store, waiters).await
         }
         _ => RespValue::Error(Bytes::from(format!("ERR unknown command '{}'", parsed.command()))),
     }

@@ -12,8 +12,18 @@ pub fn handle(parsed: ParsedCommand, config: &Arc<Config>, store: &Arc<Store>) -
     match parsed.command() {
         Command::Config => handle_config(parsed, config),
         Command::Keys => handle_keys(parsed, store),
+        Command::Type => handle_type(parsed, store),
         _ => RespValue::Error(Bytes::from_static(b"ERR unknown server command")),
     }
+}
+
+// Handler for the TYPE command.
+fn handle_type(parsed: ParsedCommand, store: &Store) -> RespValue {
+    let Some(key) = parsed.first() else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'type' command"));
+    };
+    let type_name = store.get_type(key);
+    RespValue::SimpleString(Bytes::from(type_name))
 }
 
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {

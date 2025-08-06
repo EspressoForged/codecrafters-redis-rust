@@ -3,5 +3,6 @@ pub mod list;
 pub mod pubsub;
 pub mod replication;
 pub mod server;
+pub mod stream;
 pub mod string;
 pub mod transaction;

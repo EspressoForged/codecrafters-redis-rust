@@ -1,14 +1,15 @@
 use crate::app::error::{AppError, WRONGTYPE_ERROR};
+use crate::app::stream::{Stream, StreamEntry, StreamId};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-/// Represents the different data types that can be stored.
 #[derive(Debug, Clone)]
 pub enum DataType {
     String(Bytes),
     List(VecDeque<Bytes>),
+    Stream(Stream),
 }
 
 #[derive(Debug, Clone)]
@@ -17,7 +18,6 @@ pub struct StoreValue {
     pub expires_at: Option<Instant>,
 }
 
-/// A thread-safe, in-memory key-value store using DashMap for high concurrency.
 #[derive(Debug, Default)]
 pub struct Store {
     data: DashMap<Bytes, StoreValue>,
@@ -28,20 +28,29 @@ impl Store {
         Self::default()
     }
 
-    /// Hydrates the store from data parsed from an RDB file.
     pub fn load_from_rdb(&self, rdb_store: HashMap<Bytes, StoreValue>) {
         for (key, value) in rdb_store {
             self.data.insert(key, value);
         }
     }
-
-    /// Returns all non-expired keys.
+    
     pub fn get_all_keys(&self) -> Vec<Bytes> {
         self.data
             .iter()
             .filter(|entry| !Self::is_expired(entry.value()))
             .map(|entry| entry.key().clone())
             .collect()
+    }
+    
+    pub fn get_type(&self, key: &Bytes) -> String {
+        match self.data.get(key) {
+            Some(entry) if !Self::is_expired(&entry) => match entry.data {
+                DataType::String(_) => "string".to_string(),
+                DataType::List(_) => "list".to_string(),
+                DataType::Stream(_) => "stream".to_string(),
+            },
+            _ => "none".to_string(),
+        }
     }
 
     // --- String Commands ---
@@ -63,12 +72,7 @@ impl Store {
         }
     }
 
-    pub fn set_string(
-        &self,
-        key: Bytes,
-        value: Bytes,
-        expiry: Option<Duration>,
-    ) -> Result<(), AppError> {
+    pub fn set_string(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) -> Result<(), AppError> {
         if let Some(mut entry) = self.data.get_mut(&key) {
             if !matches!(entry.data, DataType::String(_)) {
                 return Err(WRONGTYPE_ERROR);
@@ -102,7 +106,7 @@ impl Store {
                     .ok_or(AppError::ValueError(
                         "value is not an integer or out of range".into(),
                     ))?;
-
+                
                 let new_val = current_val + 1;
                 *bytes = Bytes::from(new_val.to_string());
                 Ok(new_val)
@@ -112,7 +116,7 @@ impl Store {
     }
 
     // --- List Commands ---
-    // ... (unchanged from previous phase)
+
     pub fn lpush(&self, key: Bytes, values: &[Bytes]) -> Result<usize, AppError> {
         let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
             data: DataType::List(VecDeque::new()),
@@ -228,12 +232,63 @@ impl Store {
         }
     }
 
+    // --- Stream Commands ---
+
+    pub fn xadd(&self, key: Bytes, id_spec: &str, fields: Vec<(Bytes, Bytes)>) -> Result<StreamId, AppError> {
+        let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
+            data: DataType::Stream(Stream::new()),
+            expires_at: None,
+        });
+
+        match &mut entry.value_mut().data {
+            DataType::Stream(stream) => stream.add(id_spec, fields),
+            _ => Err(WRONGTYPE_ERROR),
+        }
+    }
+
+    pub fn xrange(&self, key: &Bytes, start: &str, end: &str) -> Result<Vec<StreamEntry>, AppError> {
+        match self.data.get(key) {
+            Some(entry) if !Self::is_expired(&entry) => match &entry.data {
+                DataType::Stream(stream) => stream.range(start, end),
+                _ => Err(WRONGTYPE_ERROR),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+    
+    pub fn xread(&self, keys_and_ids: &[(&Bytes, &str)]) -> Result<Option<Vec<(Bytes, Vec<StreamEntry>)>>, AppError> {
+        let mut results = Vec::new();
+        for (key, id_spec) in keys_and_ids {
+            let stream_data = match self.data.get(*key) {
+                Some(entry) if !Self::is_expired(&entry) => match &entry.data {
+                    DataType::Stream(stream) => {
+                        let entries = stream.read_from(id_spec)?;
+                        if !entries.is_empty() {
+                            Some(((*key).clone(), entries))
+                        } else { None }
+                    }
+                    _ => return Err(WRONGTYPE_ERROR),
+                },
+                _ => None,
+            };
+            if let Some(data) = stream_data {
+                results.push(data);
+            }
+        }
+        
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(results))
+        }
+    }
+
     // --- Helper Functions ---
 
     fn is_expired(value: &StoreValue) -> bool {
         matches!(value.expires_at, Some(t) if Instant::now() > t)
     }
-
+    
     fn normalize_index(index: i64, len: i64) -> usize {
         if index >= 0 {
             index as usize
