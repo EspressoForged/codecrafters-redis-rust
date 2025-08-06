@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use codecrafters_redis::{
     app,
-    app::{rdb, replication::ReplicationState, store::Store, wait::WaiterRegistry},
+    app::{
+        pubsub::PubSubHub, rdb, replication::ReplicationState, store::Store, wait::WaiterRegistry,
+    },
     config::Config,
     foundation::{net, shutdown},
     logging,
@@ -36,8 +38,8 @@ async fn main() -> Result<()> {
 
     let replication_state = Arc::new(ReplicationState::new_from_config(&config));
     let waiters = Arc::new(WaiterRegistry::new());
+    let pubsub_hub = Arc::new(PubSubHub::new());
 
-    // If in replica mode, spawn a background task to connect to the master.
     if replication_state.role() == app::replication::Role::Replica {
         let master_addr = config.replicaof.clone().unwrap();
         info!("Running in replica mode, will connect to master at {master_addr}");
@@ -63,12 +65,21 @@ async fn main() -> Result<()> {
         let waiters = Arc::clone(&waiters);
         let config = Arc::clone(&config);
         let replication_state = Arc::clone(&replication_state);
+        let pubsub_hub = Arc::clone(&pubsub_hub);
         move |stream| {
             let store = Arc::clone(&store);
             let waiters = Arc::clone(&waiters);
             let config = Arc::clone(&config);
             let replication_state = Arc::clone(&replication_state);
-            app::handle_connection(stream, store, waiters, config, replication_state)
+            let pubsub_hub = Arc::clone(&pubsub_hub);
+            app::handle_connection(
+                stream,
+                store,
+                waiters,
+                config,
+                replication_state,
+                pubsub_hub,
+            )
         }
     };
 

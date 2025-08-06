@@ -1,6 +1,7 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     protocol::{RespDecoder, RespValue},
+    pubsub::PubSubHub,
     replication::ReplicationState,
     store::Store,
     wait::WaiterRegistry,
@@ -8,6 +9,8 @@ use crate::app::{
 use crate::config::Config;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -20,14 +23,22 @@ use tracing::{debug, error, info, warn};
 pub mod command;
 pub mod error;
 pub mod protocol;
+pub mod pubsub;
 pub mod rdb;
 pub mod replication;
 pub mod store;
 pub mod wait;
 
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
+
 enum ConnectionState {
     Normal,
     InTransaction,
+    Subscribed {
+        client_id: u64,
+        subscriptions: HashSet<Bytes>,
+        rx: mpsc::Receiver<RespValue>,
+    },
 }
 
 pub async fn handle_connection(
@@ -36,13 +47,23 @@ pub async fn handle_connection(
     waiters: Arc<WaiterRegistry>,
     config: Arc<Config>,
     replication: Arc<ReplicationState>,
+    pubsub: Arc<PubSubHub>,
 ) {
+    let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
     let mut command_queue: Vec<ParsedCommand> = Vec::new();
-    let wait_notify = Arc::new(Notify::new()); // Notify for WAIT commands
+    let wait_notify = Arc::new(Notify::new());
 
     loop {
+        if let ConnectionState::Subscribed { ref mut subscriptions, ref mut rx, .. } = state {
+            if subscribed_loop(&mut framed, subscriptions, rx, &pubsub, client_id).await.is_err() {
+                info!("Client {client_id} disconnected from subscribed mode.");
+                pubsub.unsubscribe_all(client_id, subscriptions);
+                return;
+            }
+        }
+        
         match framed.next().await {
             Some(Ok(value)) => {
                 debug!("received RESP value: {value:?}");
@@ -56,31 +77,38 @@ pub async fn handle_connection(
                     }
                 };
 
+                // CORRECTED: Handle state-transitioning commands at the top level.
+                if parsed_command.command() == Command::Subscribe {
+                    let (tx, rx) = mpsc::channel(128);
+                    // Start with an empty set of current subscriptions for a new transition.
+                    let (response, new_subs) = handle_subscribe(parsed_command, &pubsub, client_id, tx, &HashSet::new());
+                    if let Err(e) = framed.send(response).await {
+                         error!("failed to send subscribe response: {e}");
+                         return;
+                    }
+                    state = ConnectionState::Subscribed { client_id, subscriptions: new_subs, rx };
+                    continue; // Immediately switch to the subscribed loop behavior.
+                }
+
                 if parsed_command.command() == Command::PSync {
                     info!("Replica requested PSYNC, starting full resync.");
                     let response = RespValue::SimpleString(Bytes::from(format!(
                         "FULLRESYNC {} 0",
                         replication.master_replid()
                     )));
-                    if let Err(e) = framed.send(response).await {
-                        error!("Failed to send FULLRESYNC response: {e}");
-                        return;
-                    }
+                    if let Err(e) = framed.send(response).await { error!("Failed to send FULLRESYNC response: {e}"); return; }
                     let rdb_bytes = rdb::empty_rdb_bytes();
-                    if let Err(e) = framed.get_mut().write_all(&rdb_bytes).await {
-                        error!("Failed to send RDB file: {e}");
-                        return;
-                    }
+                    if let Err(e) = framed.get_mut().write_all(&rdb_bytes).await { error!("Failed to send RDB file: {e}"); return; }
                     
                     let (tx, rx) = mpsc::channel(128);
                     let ack_offset = replication.add_replica(tx).await;
-                    tokio::spawn(replication::serve_replica(rx, framed, ack_offset, Arc::clone(&wait_notify)));
+                    tokio::spawn(replication::serve_replica(rx, framed,  ack_offset, Arc::clone(&wait_notify)));
                     info!("Connection transitioned to replica serving mode, breaking main loop.");
                     return;
                 }
                 
                 let response = handle_command(
-                    parsed_command, &store, &waiters, &config, &replication,
+                    parsed_command, &store, &waiters, &config, &replication, &pubsub,
                     &mut state, &mut command_queue, &wait_notify,
                 ).await;
 
@@ -95,6 +123,77 @@ pub async fn handle_connection(
     }
 }
 
+async fn subscribed_loop(
+    framed: &mut Framed<TcpStream, RespDecoder>,
+    subscriptions: &mut HashSet<Bytes>,
+    rx: &mut mpsc::Receiver<RespValue>,
+    pubsub: &PubSubHub,
+    client_id: u64,
+) -> Result<(), ()> {
+    loop {
+        tokio::select! {
+            Some(message) = rx.recv() => {
+                if let Err(e) = framed.send(message).await {
+                    error!("failed to send published message to client: {e}");
+                    return Err(());
+                }
+            }
+            result = framed.next() => {
+                match result {
+                    Some(Ok(value)) => {
+                         let parsed_command = match ParsedCommand::from_resp(value) {
+                             Ok(cmd) => cmd,
+                             Err(e) => {
+                                 if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
+                                     error!("failed to send error response: {e}");
+                                 }
+                                 continue;
+                             }
+                         };
+                         
+                        let cmd = parsed_command.command();
+                        let allowed_in_sub_mode = matches!(cmd, Command::Subscribe | Command::Unsubscribe | Command::Ping);
+                        
+                        if !allowed_in_sub_mode {
+                             let err_msg = format!("ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmd);
+                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await {
+                                  error!("failed to send subscribed mode error: {e}");
+                                  return Err(());
+                             }
+                             continue;
+                        }
+
+                        let response = if cmd == Command::Subscribe {
+                             let (tx, _new_rx) = mpsc::channel(128);
+                             let (resp, new_subs) = handle_subscribe(parsed_command, pubsub, client_id, tx, subscriptions);
+                             subscriptions.extend(new_subs);
+                             resp
+                        } else if cmd == Command::Unsubscribe {
+                             let (resp, removed_subs) = handle_unsubscribe(parsed_command, pubsub, client_id, subscriptions);
+                             for sub in removed_subs {
+                                  subscriptions.remove(&sub);
+                             }
+                             resp
+                        } else if cmd == Command::Ping {
+                             RespValue::Array(vec![
+                                  RespValue::BulkString(Bytes::from_static(b"pong")),
+                                  RespValue::BulkString(Bytes::from_static(b"")),
+                             ])
+                        } else { unreachable!() };
+                        
+                         if let Err(e) = framed.send(response).await {
+                              error!("failed to send response in subscribed mode: {e}");
+                              return Err(());
+                         }
+                    }
+                    Some(Err(e)) => { error!("error reading from stream in subscribed mode: {e}"); return Err(()); }
+                    None => return Err(()),
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     parsed: ParsedCommand,
@@ -102,11 +201,12 @@ async fn handle_command(
     waiters: &Arc<WaiterRegistry>,
     config: &Arc<Config>,
     replication: &Arc<ReplicationState>,
+    pubsub: &Arc<PubSubHub>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
     wait_notify: &Arc<Notify>,
 ) -> RespValue {
-    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters, config, replication, wait_notify).await {
+    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters, config, replication, pubsub, wait_notify).await {
         return response;
     }
     
@@ -126,6 +226,9 @@ async fn handle_command(
     }
 
     match command {
+        // CORRECTED: Removed the incorrect check and removed Subscribe/Unsubscribe from this match.
+        // They are now handled exclusively by the state-transitioning logic.
+        Command::Publish => handle_publish(parsed, pubsub),
         Command::Ping => RespValue::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => handle_echo(parsed),
         Command::Set => handle_set(parsed, store),
@@ -142,7 +245,6 @@ async fn handle_command(
         Command::LLen => handle_llen(parsed, store),
         Command::LRange => handle_lrange(parsed, store),
         Command::BLPop => handle_blpop(parsed, store, waiters).await,
-        Command::PSync => RespValue::Error(Bytes::from_static(b"ERR PSYNC cannot be called in this context")),
         _ => RespValue::Error(Bytes::from(format!("ERR unknown command '{}'", parsed.command()))),
     }
 }
@@ -155,6 +257,7 @@ async fn handle_transaction_state(
     waiters: &Arc<WaiterRegistry>,
     config: &Arc<Config>,
     replication: &Arc<ReplicationState>,
+    pubsub: &Arc<PubSubHub>,
     wait_notify: &Arc<Notify>,
 ) -> Option<RespValue> {
     match parsed.command() {
@@ -169,7 +272,7 @@ async fn handle_transaction_state(
             *state = ConnectionState::Normal;
             let mut responses = Vec::with_capacity(queue.len());
             for cmd in std::mem::take(queue) {
-                let response = Box::pin(handle_command(cmd, store, waiters, config, replication, &mut ConnectionState::Normal, &mut vec![], wait_notify)).await;
+                let response = Box::pin(handle_command(cmd, store, waiters, config, replication, pubsub, &mut ConnectionState::Normal, &mut vec![], wait_notify)).await;
                 responses.push(response);
             }
             Some(RespValue::Array(responses))
@@ -182,6 +285,73 @@ async fn handle_transaction_state(
         }
         _ => None,
     }
+}
+
+fn handle_subscribe(
+    parsed: ParsedCommand,
+    pubsub: &PubSubHub,
+    client_id: u64,
+    sender: mpsc::Sender<RespValue>,
+    current_subs: &HashSet<Bytes>,
+) -> (RespValue, HashSet<Bytes>) {
+    let channels = parsed.args_from(0);
+    let mut new_subs = HashSet::new();
+    for channel in channels {
+        if !current_subs.contains(channel) {
+            pubsub.subscribe(channel.clone(), client_id, sender.clone());
+            new_subs.insert(channel.clone());
+        }
+    }
+    
+    let first_channel = channels.first().cloned().unwrap_or_default();
+    let count = current_subs.len() + new_subs.len();
+    
+    let response = RespValue::Array(vec![
+        RespValue::BulkString(Bytes::from_static(b"subscribe")),
+        RespValue::BulkString(first_channel),
+        RespValue::Integer(count as i64),
+    ]);
+    (response, new_subs)
+}
+
+fn handle_unsubscribe(
+    parsed: ParsedCommand,
+    pubsub: &PubSubHub,
+    client_id: u64,
+    current_subs: &HashSet<Bytes>,
+) -> (RespValue, Vec<Bytes>) {
+    let channels_to_unsub = if parsed.args_from(0).is_empty() {
+        current_subs.iter().cloned().collect()
+    } else {
+        parsed.args_from(0).to_vec()
+    };
+
+    let mut removed_subs = Vec::new();
+    let mut count = current_subs.len();
+    for channel in &channels_to_unsub {
+        if current_subs.contains(channel) {
+            pubsub.unsubscribe(channel, client_id);
+            removed_subs.push(channel.clone());
+            count -= 1;
+        }
+    }
+    
+    let first_channel = channels_to_unsub.first().cloned().unwrap_or_default();
+    let response = RespValue::Array(vec![
+        RespValue::BulkString(Bytes::from_static(b"unsubscribe")),
+        RespValue::BulkString(first_channel),
+        RespValue::Integer(count as i64),
+    ]);
+    (response, removed_subs)
+}
+
+fn handle_publish(parsed: ParsedCommand, pubsub: &PubSubHub) -> RespValue {
+    let (Some(channel), Some(message)) = (parsed.arg(0), parsed.arg(1)) else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"));
+    };
+    
+    let subscriber_count = pubsub.publish(channel.clone(), message.clone());
+    RespValue::Integer(subscriber_count as i64)
 }
 
 fn handle_info(parsed: ParsedCommand, replication: &ReplicationState) -> RespValue {
@@ -214,18 +384,12 @@ async fn handle_wait(parsed: ParsedCommand, replication: &ReplicationState, wait
 
     let target_offset = replication.master_repl_offset();
     
-    // Fast path: check if enough replicas are already synchronized.
     let already_synced = replication.count_acks(target_offset).await;
     if already_synced >= num_replicas {
         return RespValue::Integer(already_synced as i64);
     }
     
-    // Slow path: broadcast GETACK and wait.
     replication.broadcast_getack().await;
-
-    // Register this command's waiting condition.
-    // The `wait_notify` is cloned and sent to the registry.
-    replication.wait_waiters.register_wait_notifier(Arc::clone(wait_notify)).await;
 
     let timeout_future = time::sleep(Duration::from_millis(timeout_ms));
     tokio::pin!(timeout_future);
@@ -233,18 +397,14 @@ async fn handle_wait(parsed: ParsedCommand, replication: &ReplicationState, wait
     loop {
         tokio::select! {
             _ = &mut timeout_future => {
-                // Timeout elapsed, return the number of replicas that have synced so far.
                 let final_count = replication.count_acks(target_offset).await;
                 return RespValue::Integer(final_count as i64);
             }
             _ = wait_notify.notified() => {
-                // An ACK was received, check if we've met the condition.
                 let synced_count = replication.count_acks(target_offset).await;
                 if synced_count >= num_replicas {
                     return RespValue::Integer(synced_count as i64);
                 }
-                // If not enough replicas are synced, and we were notified,
-                // this means another ACK came in, so we loop to await more.
             }
         }
     }
