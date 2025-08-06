@@ -20,7 +20,9 @@ pub fn handle(parsed: ParsedCommand, config: &Arc<Config>, store: &Arc<Store>) -
 // Handler for the TYPE command.
 fn handle_type(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'type' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'type' command",
+        ));
     };
     let type_name = store.get_type(key);
     RespValue::SimpleString(Bytes::from(type_name))
@@ -28,12 +30,16 @@ fn handle_type(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
     let Some(verb) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'config' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'config' command",
+        ));
     };
     let Some(key_bytes) = parsed.arg(1) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'config' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'config' command",
+        ));
     };
-    
+
     if !verb.eq_ignore_ascii_case(b"get") {
         return RespValue::Error(Bytes::from_static(b"ERR CONFIG only supports GET"));
     }
@@ -58,9 +64,11 @@ fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
 
 fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(pattern) = parsed.first() else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'keys' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'keys' command",
+        ));
     };
-    
+
     if &pattern[..] != b"*" {
         warn!("Received KEYS command with non-'*' pattern, which is not supported.");
         return RespValue::Array(vec![]);

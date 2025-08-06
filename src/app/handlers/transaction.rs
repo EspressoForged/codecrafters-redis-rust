@@ -1,15 +1,12 @@
 use crate::app::{
-    command::ParsedCommand,
-    pubsub::PubSubHub,
-    replication::ReplicationState,
-    store::Store,
-    wait::WaiterRegistry,
-    ConnectionState, RespValue,
+    command::ParsedCommand, pubsub::PubSubHub, replication::ReplicationState, store::Store,
+    wait::WaiterRegistry, ConnectionState, RespValue,
 };
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_state(
     parsed: ParsedCommand,
     state: &mut ConnectionState,
@@ -24,7 +21,9 @@ pub async fn handle_state(
     match parsed.command() {
         crate::app::command::Command::Multi => {
             if matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR MULTI calls can not be nested",
+                )));
             }
             *state = ConnectionState::InTransaction;
             queue.clear();
@@ -32,22 +31,34 @@ pub async fn handle_state(
         }
         crate::app::command::Command::Exec => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR EXEC without MULTI",
+                )));
             }
             *state = ConnectionState::Normal;
             let mut responses = Vec::with_capacity(queue.len());
             for cmd in std::mem::take(queue) {
                 let response = Box::pin(crate::app::handle_command(
-                    cmd, store, waiters, config, replication, pubsub,
-                    &mut ConnectionState::Normal, &mut vec![], wait_notify
-                )).await;
+                    cmd,
+                    store,
+                    waiters,
+                    config,
+                    replication,
+                    pubsub,
+                    &mut ConnectionState::Normal,
+                    &mut vec![],
+                    wait_notify,
+                ))
+                .await;
                 responses.push(response);
             }
             Some(RespValue::Array(responses))
         }
         crate::app::command::Command::Discard => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
+                return Some(RespValue::Error(Bytes::from_static(
+                    b"ERR DISCARD without MULTI",
+                )));
             }
             *state = ConnectionState::Normal;
             queue.clear();

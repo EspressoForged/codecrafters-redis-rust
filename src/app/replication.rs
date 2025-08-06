@@ -6,7 +6,10 @@ use crate::app::{
 use anyhow::Result;
 use bytes::{Buf, Bytes};
 use futures::{SinkExt, StreamExt};
-use std::sync::{atomic::{AtomicUsize, Ordering}, Arc};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Mutex, Notify};
@@ -52,10 +55,16 @@ impl ReplicationState {
             wait_waiters: crate::app::wait::WaiterRegistry::new(),
         }
     }
-    
-    pub fn role(&self) -> Role { self.role }
-    pub fn master_replid(&self) -> &str { &self.master_replid }
-    pub fn master_repl_offset(&self) -> usize { self.master_repl_offset.load(Ordering::Relaxed) }
+
+    pub fn role(&self) -> Role {
+        self.role
+    }
+    pub fn master_replid(&self) -> &str {
+        &self.master_replid
+    }
+    pub fn master_repl_offset(&self) -> usize {
+        self.master_repl_offset.load(Ordering::Relaxed)
+    }
 
     pub async fn replica_count(&self) -> usize {
         self.replicas.lock().await.len()
@@ -64,7 +73,11 @@ impl ReplicationState {
     pub fn info_string(&self) -> String {
         format!(
             "role:{}\r\nmaster_replid:{}\r\nmaster_repl_offset:{}",
-            if self.role == Role::Master { "master" } else { "slave" },
+            if self.role == Role::Master {
+                "master"
+            } else {
+                "slave"
+            },
             self.master_replid,
             self.master_repl_offset()
         )
@@ -79,13 +92,14 @@ impl ReplicationState {
         });
         ack_offset
     }
-    
+
     pub fn propagate(self: Arc<Self>, cmd: ParsedCommand) {
         tokio::spawn(async move {
             let resp_array = cmd.into_resp_array();
             let bytes = resp_array.encode_to_bytes();
-            self.master_repl_offset.fetch_add(bytes.len(), Ordering::Relaxed);
-            
+            self.master_repl_offset
+                .fetch_add(bytes.len(), Ordering::Relaxed);
+
             let replicas = self.replicas.lock().await;
             for replica_info in replicas.iter() {
                 if let Err(e) = replica_info.sender.send(resp_array.clone()).await {
@@ -150,28 +164,38 @@ async fn perform_handshake(
 ) -> Result<()> {
     let mut framed = Framed::new(stream, RespDecoder);
 
-    framed.send(RespValue::Array(vec![RespValue::BulkString(Bytes::from_static(b"PING"))])).await?;
+    framed
+        .send(RespValue::Array(vec![RespValue::BulkString(
+            Bytes::from_static(b"PING"),
+        )]))
+        .await?;
     let _ = framed.next().await.unwrap()?;
 
-    framed.send(RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-        RespValue::BulkString(Bytes::from_static(b"listening-port")),
-        RespValue::BulkString(Bytes::from(listening_port.to_string())),
-    ])).await?;
+    framed
+        .send(RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
+            RespValue::BulkString(Bytes::from_static(b"listening-port")),
+            RespValue::BulkString(Bytes::from(listening_port.to_string())),
+        ]))
+        .await?;
     let _ = framed.next().await.unwrap()?;
 
-    framed.send(RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-        RespValue::BulkString(Bytes::from_static(b"capa")),
-        RespValue::BulkString(Bytes::from_static(b"psync2")),
-    ])).await?;
+    framed
+        .send(RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
+            RespValue::BulkString(Bytes::from_static(b"capa")),
+            RespValue::BulkString(Bytes::from_static(b"psync2")),
+        ]))
+        .await?;
     let _ = framed.next().await.unwrap()?;
 
-    framed.send(RespValue::Array(vec![
-        RespValue::BulkString(Bytes::from_static(b"PSYNC")),
-        RespValue::BulkString(Bytes::from_static(b"?")),
-        RespValue::BulkString(Bytes::from_static(b"-1")),
-    ])).await?;
+    framed
+        .send(RespValue::Array(vec![
+            RespValue::BulkString(Bytes::from_static(b"PSYNC")),
+            RespValue::BulkString(Bytes::from_static(b"?")),
+            RespValue::BulkString(Bytes::from_static(b"-1")),
+        ]))
+        .await?;
     let _ = framed.next().await.unwrap()?;
 
     info!("Handshake complete. Receiving RDB file from master.");
@@ -182,12 +206,14 @@ async fn perform_handshake(
 
     let mut line_buffer = Vec::new();
     loop {
-        if read_buf.is_empty() {
-            if stream.read_buf(&mut read_buf).await? == 0 { break; }
+        if read_buf.is_empty() && stream.read_buf(&mut read_buf).await? == 0 {
+            break;
         }
         let byte = read_buf.get_u8();
         line_buffer.push(byte);
-        if line_buffer.ends_with(b"\r\n") { break; }
+        if line_buffer.ends_with(b"\r\n") {
+            break;
+        }
     }
     let len_str = std::str::from_utf8(&line_buffer[1..line_buffer.len() - 2])?;
     let rdb_len = len_str.parse::<usize>()?;
@@ -196,7 +222,7 @@ async fn perform_handshake(
         stream.read_buf(&mut read_buf).await?;
     }
     read_buf.advance(rdb_len);
-    
+
     let mut new_parts = FramedParts::new(stream, parts.codec);
     new_parts.read_buf = read_buf;
     let mut framed = Framed::from_parts(new_parts);
@@ -212,30 +238,39 @@ async fn perform_handshake(
                 let parsed_command = ParsedCommand::from_resp(value)?;
 
                 let cmd = parsed_command.command();
-                let is_write = matches!(cmd, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
-                
+                let is_write = matches!(
+                    cmd,
+                    Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr
+                );
+
                 if is_write {
                     match cmd {
                         Command::Set => {
-                             if let (Some(key), Some(val)) = (parsed_command.arg(0), parsed_command.arg(1)) {
-                                 if let Err(e) = store.set_string(key.clone(), val.clone(), None) {
-                                      warn!("Replica failed to apply SET command: {e}");
-                                 }
-                             }
-                        },
-                        _ => { warn!("Unsupported write command on replica: {:?}", cmd); }
+                            if let (Some(key), Some(val)) =
+                                (parsed_command.arg(0), parsed_command.arg(1))
+                            {
+                                if let Err(e) = store.set_string(key.clone(), val.clone(), None) {
+                                    warn!("Replica failed to apply SET command: {e}");
+                                }
+                            }
+                        }
+                        _ => {
+                            warn!("Unsupported write command on replica: {:?}", cmd);
+                        }
                     }
                 }
 
-                if parsed_command.command() == Command::ReplConf {
-                    if parsed_command.arg(0).map_or(false, |a| a.eq_ignore_ascii_case(b"getack")) {
-                        let ack_response = RespValue::Array(vec![
-                            RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
-                            RespValue::BulkString(Bytes::from_static(b"ACK")),
-                            RespValue::BulkString(Bytes::from(offset.to_string())),
-                        ]);
-                        framed.send(ack_response).await?;
-                    }
+                if parsed_command.command() == Command::ReplConf
+                    && parsed_command
+                        .arg(0)
+                        .map_or(false, |a| a.eq_ignore_ascii_case(b"getack"))
+                {
+                    let ack_response = RespValue::Array(vec![
+                        RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
+                        RespValue::BulkString(Bytes::from_static(b"ACK")),
+                        RespValue::BulkString(Bytes::from(offset.to_string())),
+                    ]);
+                    framed.send(ack_response).await?;
                 }
                 offset += raw_bytes.len();
             }
@@ -249,7 +284,7 @@ async fn perform_handshake(
             }
         }
     }
-    
+
     Ok(())
 }
 

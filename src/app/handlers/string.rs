@@ -18,7 +18,9 @@ pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 
 fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
     let (Some(key), Some(value)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'set' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'set' command",
+        ));
     };
 
     let mut expiry = None;
@@ -31,10 +33,12 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
                 {
                     expiry = Some(Duration::from_millis(millis));
                 } else {
-                    return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range"));
+                    return RespValue::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
                 }
             } else {
-                 return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
+                return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
             }
         } else {
             return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
@@ -49,7 +53,9 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'get' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'get' command",
+        ));
     };
     match store.get_string(key) {
         Ok(Some(value)) => RespValue::BulkString(value),
@@ -60,7 +66,9 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'incr' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'incr' command",
+        ));
     };
     match store.incr(key) {
         Ok(new_value) => RespValue::Integer(new_value),

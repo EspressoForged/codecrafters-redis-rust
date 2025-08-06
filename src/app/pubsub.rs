@@ -1,7 +1,7 @@
 use crate::app::protocol::RespValue;
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::{HashSet};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -39,12 +39,12 @@ impl PubSubHub {
             }
         }
     }
-    
+
     /// Unsubscribes a client from all channels they are part of.
     pub fn unsubscribe_all(&self, client_id: ClientId, subscriptions: &HashSet<Bytes>) {
-         for channel in subscriptions {
-              self.unsubscribe(channel, client_id);
-         }
+        for channel in subscriptions {
+            self.unsubscribe(channel, client_id);
+        }
     }
 
     /// Publishes a message to all subscribers of a channel.
@@ -59,9 +59,9 @@ impl PubSubHub {
             RespValue::BulkString(channel),
             RespValue::BulkString(message),
         ]);
-        
+
         let mut recipient_count = 0;
-        
+
         // We iterate over subscribers, cloning their senders. If a send fails,
         // it means the client has disconnected, but we don't handle cleanup here
         // for simplicity. The client's main task handles full cleanup on disconnect.
@@ -71,7 +71,7 @@ impl PubSubHub {
                 recipient_count += 1;
             }
         }
-        
+
         debug!("Published message to {recipient_count} subscribers.");
         recipient_count
     }

@@ -13,9 +13,11 @@ use tracing::error;
 
 pub fn publish(parsed: ParsedCommand, pubsub: &PubSubHub) -> RespValue {
     let (Some(channel), Some(message)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'publish' command",
+        ));
     };
-    
+
     let subscriber_count = pubsub.publish(channel.clone(), message.clone());
     RespValue::Integer(subscriber_count as i64)
 }
@@ -35,10 +37,10 @@ pub fn subscribe(
             new_subs.insert(channel.clone());
         }
     }
-    
+
     let first_channel = channels.first().cloned().unwrap_or_default();
     let count = current_subs.len() + new_subs.len();
-    
+
     let response = RespValue::Array(vec![
         RespValue::BulkString(Bytes::from_static(b"subscribe")),
         RespValue::BulkString(first_channel),
@@ -68,7 +70,7 @@ pub fn unsubscribe(
             count -= 1;
         }
     }
-    
+
     let first_channel = channels_to_unsub.first().cloned().unwrap_or_default();
     let response = RespValue::Array(vec![
         RespValue::BulkString(Bytes::from_static(b"unsubscribe")),
@@ -104,12 +106,12 @@ pub async fn subscribed_loop(
                                  continue;
                              }
                          };
-                         
+
                         let cmd = parsed_command.command();
                         let allowed_in_sub_mode = matches!(cmd, Command::Subscribe | Command::Unsubscribe | Command::Ping);
-                        
+
                         if !allowed_in_sub_mode {
-                             let err_msg = format!("ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmd);
+                             let err_msg = format!("ERR Can't execute '{cmd}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context");
                              if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await { error!("failed to send subscribed mode error: {e}"); return Err(()); }
                              continue;
                         }
@@ -130,7 +132,7 @@ pub async fn subscribed_loop(
                                   RespValue::BulkString(Bytes::from_static(b"")),
                              ])
                         } else { unreachable!() };
-                        
+
                          if let Err(e) = framed.send(response).await {
                               error!("failed to send response in subscribed mode: {e}");
                               return Err(());

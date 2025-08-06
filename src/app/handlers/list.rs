@@ -1,10 +1,5 @@
 use crate::app::command::Command;
-use crate::app::{
-    command::ParsedCommand,
-    protocol::RespValue,
-    store::Store,
-    wait::WaiterRegistry,
-};
+use crate::app::{command::ParsedCommand, protocol::RespValue, store::Store, wait::WaiterRegistry};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +21,12 @@ pub async fn handle(
     }
 }
 
-fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, left: bool) -> RespValue {
+fn handle_push(
+    parsed: ParsedCommand,
+    store: &Store,
+    waiters: &WaiterRegistry,
+    left: bool,
+) -> RespValue {
     let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
@@ -76,21 +76,33 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> RespValue {
-    let Some((keys, timeout_str)) = parsed.args_from(0)
+    let Some((keys, timeout_str)) = parsed
+        .args_from(0)
         .split_last()
-        .map(|(last, elements)| (elements, last)) else {
+        .map(|(last, elements)| (elements, last))
+    else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let timeout_secs = match std::str::from_utf8(timeout_str).ok().and_then(|s| s.parse::<f64>().ok()) {
+    let timeout_secs = match std::str::from_utf8(timeout_str)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+    {
         Some(t) => t,
-        None => return RespValue::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR timeout is not a float or out of range",
+            ))
+        }
     };
 
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value)]);
+                return RespValue::Array(vec![
+                    RespValue::BulkString(key.clone()),
+                    RespValue::BulkString(value),
+                ]);
             }
         }
     }
@@ -102,15 +114,18 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
     };
 
     waiters.wait_for_any(keys, timeout).await;
-    
+
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value)]);
+                return RespValue::Array(vec![
+                    RespValue::BulkString(key.clone()),
+                    RespValue::BulkString(value),
+                ]);
             }
         }
     }
-    
+
     RespValue::NullBulkString
 }
 
@@ -125,17 +140,33 @@ fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let (Some(key), Some(start_str), Some(stop_str)) = (parsed.arg(0), parsed.arg(1), parsed.arg(2)) else {
+    let (Some(key), Some(start_str), Some(stop_str)) =
+        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
+    else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let start = match std::str::from_utf8(start_str).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let start = match std::str::from_utf8(start_str)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
-    let stop = match std::str::from_utf8(stop_str).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let stop = match std::str::from_utf8(stop_str)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
 
     match store.lrange(key, start, stop) {

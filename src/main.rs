@@ -28,11 +28,17 @@ async fn main() -> Result<()> {
     let store = Arc::new(Store::new());
     match rdb::load(&config) {
         Ok(rdb_store) => {
-            info!("RDB file loaded successfully, {} keys found.", rdb_store.len());
+            info!(
+                "RDB file loaded successfully, {} keys found.",
+                rdb_store.len()
+            );
             store.load_from_rdb(rdb_store);
         }
         Err(e) => {
-            warn!("Failed to load RDB file: {}. Starting with an empty state.", e);
+            warn!(
+                "Failed to load RDB file: {}. Starting with an empty state.",
+                e
+            );
         }
     }
 
