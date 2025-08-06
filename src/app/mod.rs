@@ -18,7 +18,7 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, Notify};
 use tokio::time;
 use tokio_util::codec::Framed;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 pub mod command;
 pub mod error;
@@ -37,6 +37,8 @@ enum ConnectionState {
     Subscribed {
         client_id: u64,
         subscriptions: HashSet<Bytes>,
+        // CORRECTED: The sender must be stored alongside the receiver.
+        tx: mpsc::Sender<RespValue>,
         rx: mpsc::Receiver<RespValue>,
     },
 }
@@ -56,8 +58,9 @@ pub async fn handle_connection(
     let wait_notify = Arc::new(Notify::new());
 
     loop {
-        if let ConnectionState::Subscribed { ref mut subscriptions, ref mut rx, .. } = state {
-            if subscribed_loop(&mut framed, subscriptions, rx, &pubsub, client_id).await.is_err() {
+        // CORRECTED: Pass the `tx` into the subscribed loop.
+        if let ConnectionState::Subscribed { client_id, ref mut subscriptions, ref tx, ref mut rx } = state {
+            if subscribed_loop(&mut framed, subscriptions, tx, rx, &pubsub, client_id).await.is_err() {
                 info!("Client {client_id} disconnected from subscribed mode.");
                 pubsub.unsubscribe_all(client_id, subscriptions);
                 return;
@@ -66,43 +69,32 @@ pub async fn handle_connection(
         
         match framed.next().await {
             Some(Ok(value)) => {
-                debug!("received RESP value: {value:?}");
                 let parsed_command = match ParsedCommand::from_resp(value) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
-                            error!("failed to send error response: {e}");
-                        }
+                        if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await { error!("failed to send error response: {e}"); }
                         continue;
                     }
                 };
 
-                // CORRECTED: Handle state-transitioning commands at the top level.
                 if parsed_command.command() == Command::Subscribe {
                     let (tx, rx) = mpsc::channel(128);
-                    // Start with an empty set of current subscriptions for a new transition.
-                    let (response, new_subs) = handle_subscribe(parsed_command, &pubsub, client_id, tx, &HashSet::new());
-                    if let Err(e) = framed.send(response).await {
-                         error!("failed to send subscribe response: {e}");
-                         return;
-                    }
-                    state = ConnectionState::Subscribed { client_id, subscriptions: new_subs, rx };
-                    continue; // Immediately switch to the subscribed loop behavior.
+                    let (response, new_subs) = handle_subscribe(parsed_command, &pubsub, client_id, tx.clone(), &HashSet::new());
+                    if let Err(e) = framed.send(response).await { error!("failed to send subscribe response: {e}"); return; }
+                    state = ConnectionState::Subscribed { client_id, subscriptions: new_subs, tx, rx };
+                    continue;
                 }
 
                 if parsed_command.command() == Command::PSync {
                     info!("Replica requested PSYNC, starting full resync.");
-                    let response = RespValue::SimpleString(Bytes::from(format!(
-                        "FULLRESYNC {} 0",
-                        replication.master_replid()
-                    )));
+                    let response = RespValue::SimpleString(Bytes::from(format!("FULLRESYNC {} 0", replication.master_replid())));
                     if let Err(e) = framed.send(response).await { error!("Failed to send FULLRESYNC response: {e}"); return; }
                     let rdb_bytes = rdb::empty_rdb_bytes();
                     if let Err(e) = framed.get_mut().write_all(&rdb_bytes).await { error!("Failed to send RDB file: {e}"); return; }
                     
                     let (tx, rx) = mpsc::channel(128);
                     let ack_offset = replication.add_replica(tx).await;
-                    tokio::spawn(replication::serve_replica(rx, framed,  ack_offset, Arc::clone(&wait_notify)));
+                    tokio::spawn(replication::serve_replica(rx, framed, ack_offset, Arc::clone(&wait_notify)));
                     info!("Connection transitioned to replica serving mode, breaking main loop.");
                     return;
                 }
@@ -126,6 +118,7 @@ pub async fn handle_connection(
 async fn subscribed_loop(
     framed: &mut Framed<TcpStream, RespDecoder>,
     subscriptions: &mut HashSet<Bytes>,
+    tx: &mpsc::Sender<RespValue>, // CORRECTED: Receive the existing sender.
     rx: &mut mpsc::Receiver<RespValue>,
     pubsub: &PubSubHub,
     client_id: u64,
@@ -144,9 +137,7 @@ async fn subscribed_loop(
                          let parsed_command = match ParsedCommand::from_resp(value) {
                              Ok(cmd) => cmd,
                              Err(e) => {
-                                 if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
-                                     error!("failed to send error response: {e}");
-                                 }
+                                 if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await { error!("failed to send error response: {e}"); }
                                  continue;
                              }
                          };
@@ -156,16 +147,13 @@ async fn subscribed_loop(
                         
                         if !allowed_in_sub_mode {
                              let err_msg = format!("ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context", cmd);
-                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await {
-                                  error!("failed to send subscribed mode error: {e}");
-                                  return Err(());
-                             }
+                             if let Err(e) = framed.send(RespValue::Error(Bytes::from(err_msg))).await { error!("failed to send subscribed mode error: {e}"); return Err(()); }
                              continue;
                         }
 
                         let response = if cmd == Command::Subscribe {
-                             let (tx, _new_rx) = mpsc::channel(128);
-                             let (resp, new_subs) = handle_subscribe(parsed_command, pubsub, client_id, tx, subscriptions);
+                             // CORRECTED: Clone and reuse the existing sender. Do not create a new channel.
+                             let (resp, new_subs) = handle_subscribe(parsed_command, pubsub, client_id, tx.clone(), subscriptions);
                              subscriptions.extend(new_subs);
                              resp
                         } else if cmd == Command::Unsubscribe {
@@ -216,7 +204,7 @@ async fn handle_command(
     }
 
     let command = parsed.command();
-    
+
     let is_write_command = matches!(command, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
     if is_write_command {
         if replication.role() == replication::Role::Replica {
@@ -226,8 +214,6 @@ async fn handle_command(
     }
 
     match command {
-        // CORRECTED: Removed the incorrect check and removed Subscribe/Unsubscribe from this match.
-        // They are now handled exclusively by the state-transitioning logic.
         Command::Publish => handle_publish(parsed, pubsub),
         Command::Ping => RespValue::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => handle_echo(parsed),
