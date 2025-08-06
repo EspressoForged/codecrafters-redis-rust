@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use codecrafters_redis::{
     app,
-    app::{rdb, store::Store, wait::WaiterRegistry},
+    app::{rdb, replication::ReplicationState, store::Store, wait::WaiterRegistry},
     config::Config,
     foundation::{net, shutdown},
     logging,
@@ -23,25 +23,32 @@ async fn main() -> Result<()> {
         config.listen_addr()
     );
 
-    // Load RDB file to hydrate the store before starting the server.
     let store = Arc::new(Store::new());
     match rdb::load(&config) {
         Ok(rdb_store) => {
-            info!(
-                "RDB file loaded successfully, {} keys found.",
-                rdb_store.len()
-            );
+            info!("RDB file loaded successfully, {} keys found.", rdb_store.len());
             store.load_from_rdb(rdb_store);
         }
         Err(e) => {
-            warn!(
-                "Failed to load RDB file: {}. Starting with an empty state.",
-                e
-            );
+            warn!("Failed to load RDB file: {}. Starting with an empty state.", e);
         }
     }
 
+    let replication_state = Arc::new(ReplicationState::new_from_config(&config));
     let waiters = Arc::new(WaiterRegistry::new());
+
+    // If in replica mode, spawn a background task to connect to the master.
+    if replication_state.role() == app::replication::Role::Replica {
+        let master_addr = config.replicaof.clone().unwrap();
+        info!("Running in replica mode, will connect to master at {master_addr}");
+        let repl_task = app::replication::start_replica_mode(
+            master_addr,
+            config.port,
+            Arc::clone(&store),
+            Arc::clone(&replication_state),
+        );
+        tokio::spawn(repl_task);
+    }
 
     let listener = TcpListener::bind(config.listen_addr()).await?;
 
@@ -51,16 +58,17 @@ async fn main() -> Result<()> {
             .expect("failed to install CTRL+C signal handler");
     };
 
-    // The connection handler now gets the config as well.
     let connection_handler = {
         let store = Arc::clone(&store);
         let waiters = Arc::clone(&waiters);
         let config = Arc::clone(&config);
+        let replication_state = Arc::clone(&replication_state);
         move |stream| {
             let store = Arc::clone(&store);
             let waiters = Arc::clone(&waiters);
             let config = Arc::clone(&config);
-            app::handle_connection(stream, store, waiters, config)
+            let replication_state = Arc::clone(&replication_state);
+            app::handle_connection(stream, store, waiters, config, replication_state)
         }
     };
 

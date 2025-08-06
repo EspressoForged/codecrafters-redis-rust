@@ -3,11 +3,6 @@ use bytes::Bytes;
 use std::str::FromStr;
 use strum_macros::{Display, EnumString};
 
-/// Represents the set of commands the Redis server understands.
-///
-/// Using `strum` to derive `EnumString` allows for easy, case-insensitive
-/// parsing from a string slice into a `Command` variant. `Display` allows
-/// for easy conversion back to a string for logging.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Display, EnumString)]
 #[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]
 pub enum Command {
@@ -40,7 +35,6 @@ pub enum Command {
     Unsubscribe,
 }
 
-/// Represents a command parsed from a RESP message, including its arguments.
 #[derive(Debug, Clone)]
 pub struct ParsedCommand {
     command: Command,
@@ -48,10 +42,6 @@ pub struct ParsedCommand {
 }
 
 impl ParsedCommand {
-    /// Creates a `ParsedCommand` from a `RespValue`.
-    ///
-    /// The input `RespValue` must be an Array of Bulk Strings. The first
-    /// element is the command name, and subsequent elements are arguments.
     pub fn from_resp(value: RespValue) -> Result<Self, AppError> {
         match value {
             RespValue::Array(values) => {
@@ -69,9 +59,7 @@ impl ParsedCommand {
                 let args = iter
                     .map(|val| match val {
                         RespValue::BulkString(bytes) => Ok(bytes),
-                        _ => Err(AppError::ParseError(
-                            "Argument must be a bulk string".into(),
-                        )),
+                        _ => Err(AppError::ParseError("Argument must be a bulk string".into())),
                     })
                     .collect::<Result<Vec<Bytes>, _>>()?;
 
@@ -88,13 +76,25 @@ impl ParsedCommand {
     pub fn arg(&self, index: usize) -> Option<&Bytes> {
         self.args.get(index)
     }
+    
+    pub fn first(&self) -> Option<&Bytes> {
+        self.args.first()
+    }
 
-    /// Returns a slice of all arguments starting from a given index.
     pub fn args_from(&self, start_index: usize) -> &[Bytes] {
         if start_index >= self.args.len() {
             &[]
         } else {
             &self.args[start_index..]
         }
+    }
+    
+    pub fn into_resp_array(self) -> RespValue {
+        let mut parts = Vec::with_capacity(self.args.len() + 1);
+        parts.push(RespValue::BulkString(Bytes::from(self.command.to_string())));
+        for arg in self.args {
+            parts.push(RespValue::BulkString(arg));
+        }
+        RespValue::Array(parts)
     }
 }

@@ -20,6 +20,10 @@ pub struct Config {
     /// The name of the RDB file.
     #[arg(long, default_value = "dump.rdb")]
     pub dbfilename: String,
+
+    /// The address of the master to replicate from, e.g., "localhost 6379".
+    #[arg(long)]
+    pub replicaof: Option<String>,
 }
 
 impl Config {

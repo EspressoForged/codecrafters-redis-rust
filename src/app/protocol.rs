@@ -5,7 +5,6 @@ use nom::{
     bytes::complete::{tag, take, take_until},
     character::complete::{crlf, digit1},
     combinator::{map, map_res},
-    sequence::preceded,
     IResult,
 };
 use tokio_util::codec::{Decoder, Encoder};
@@ -19,6 +18,19 @@ pub enum RespValue {
     BulkString(Bytes),
     NullBulkString,
     Array(Vec<RespValue>),
+}
+
+impl RespValue {
+    /// Encodes the `RespValue` into a `Bytes` object using our Encoder implementation.
+    pub fn encode_to_bytes(&self) -> Bytes {
+        let mut buffer = BytesMut::new();
+        let mut encoder = RespDecoder; // Our Encoder is part of the RespDecoder struct
+        
+        // The encode method should not fail for our well-defined types.
+        encoder.encode(self.clone(), &mut buffer).unwrap();
+        
+        buffer.freeze()
+    }
 }
 
 //--- Decoder (Parser) ---
@@ -40,7 +52,7 @@ impl Decoder for RespDecoder {
                 src.advance(consumed);
                 Ok(Some(value))
             }
-            Err(nom::Err::Incomplete(_)) => Ok(None), // Not enough data, wait for more
+            Err(nom::Err::Incomplete(_)) => Ok(None),
             Err(e) => Err(AppError::ParseError(e.to_string())),
         }
     }
@@ -59,44 +71,30 @@ fn parse_message(input: &[u8]) -> IResult<&[u8], RespValue> {
 
 fn parse_simple_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(
-            tag("+"),
-            nom::sequence::terminated(take_until("\r\n"), crlf),
-        ),
+        nom::sequence::preceded(tag("+"), nom::sequence::terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::SimpleString(Bytes::copy_from_slice(s)),
     )(input)
 }
 
 fn parse_error(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(
-            tag("-"),
-            nom::sequence::terminated(take_until("\r\n"), crlf),
-        ),
+        nom::sequence::preceded(tag("-"), nom::sequence::terminated(take_until("\r\n"), crlf)),
         |s: &[u8]| RespValue::Error(Bytes::copy_from_slice(s)),
     )(input)
 }
 
 fn parse_integer(input: &[u8]) -> IResult<&[u8], RespValue> {
     map(
-        preceded(
+        nom::sequence::preceded(
             tag(":"),
-            nom::sequence::terminated(
-                map_res(digit1, |s: &[u8]| {
-                    std::str::from_utf8(s).unwrap().parse::<i64>()
-                }),
-                crlf,
-            ),
+            nom::sequence::terminated(map_res(digit1, |s: &[u8]| std::str::from_utf8(s).unwrap().parse::<i64>()), crlf),
         ),
         RespValue::Integer,
     )(input)
 }
 
 fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
-    let (input, len_str) = preceded(
-        tag("$"),
-        nom::sequence::terminated(take_until("\r\n"), crlf),
-    )(input)?;
+    let (input, len_str) = nom::sequence::preceded(tag("$"), nom::sequence::terminated(take_until("\r\n"), crlf))(input)?;
     let len: i64 = std::str::from_utf8(len_str).unwrap().parse().unwrap();
 
     if len == -1 {
@@ -104,19 +102,13 @@ fn parse_bulk_string(input: &[u8]) -> IResult<&[u8], RespValue> {
     }
 
     let (input, content) = nom::sequence::terminated(take(len as usize), crlf)(input)?;
-    Ok((
-        input,
-        RespValue::BulkString(Bytes::copy_from_slice(content)),
-    ))
+    Ok((input, RespValue::BulkString(Bytes::copy_from_slice(content))))
 }
 
 fn parse_array(input: &[u8]) -> IResult<&[u8], RespValue> {
-    let (input, count_str) = preceded(
-        tag("*"),
-        nom::sequence::terminated(take_until("\r\n"), crlf),
-    )(input)?;
+    let (input, count_str) = nom::sequence::preceded(tag("*"), nom::sequence::terminated(take_until("\r\n"), crlf))(input)?;
     let count: i64 = std::str::from_utf8(count_str).unwrap().parse().unwrap();
-
+    
     if count == -1 {
         return Ok((input, RespValue::Array(vec![])));
     }

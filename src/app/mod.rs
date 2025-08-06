@@ -1,6 +1,7 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     protocol::{RespDecoder, RespValue},
+    replication::ReplicationState,
     store::Store,
     wait::WaiterRegistry,
 };
@@ -9,14 +10,17 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 pub mod command;
 pub mod error;
 pub mod protocol;
 pub mod rdb;
+pub mod replication;
 pub mod store;
 pub mod wait;
 
@@ -30,6 +34,7 @@ pub async fn handle_connection(
     store: Arc<Store>,
     waiters: Arc<WaiterRegistry>,
     config: Arc<Config>,
+    replication: Arc<ReplicationState>,
 ) {
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
@@ -42,25 +47,48 @@ pub async fn handle_connection(
                 let parsed_command = match ParsedCommand::from_resp(value) {
                     Ok(cmd) => cmd,
                     Err(e) => {
-                        if let Err(e) = framed
-                            .send(RespValue::Error(Bytes::from(e.to_string())))
-                            .await
-                        {
+                        if let Err(e) = framed.send(RespValue::Error(Bytes::from(e.to_string()))).await {
                             error!("failed to send error response: {e}");
                         }
                         continue;
                     }
                 };
 
+                // PSYNC is a special case that transitions the connection state permanently.
+                // We handle it here at the top level to solve the ownership problem of `framed`.
+                if parsed_command.command() == Command::PSync {
+                    info!("Replica requested PSYNC, starting full resync.");
+                    let response = RespValue::SimpleString(Bytes::from(format!(
+                        "FULLRESYNC {} 0",
+                        replication.master_replid()
+                    )));
+                    if let Err(e) = framed.send(response).await {
+                        error!("Failed to send FULLRESYNC response: {e}");
+                        return;
+                    }
+                    let rdb_bytes = rdb::empty_rdb_bytes();
+                    if let Err(e) = framed.get_mut().write_all(&rdb_bytes).await {
+                        error!("Failed to send RDB file: {e}");
+                        return;
+                    }
+                    
+                    let (tx, rx) = mpsc::channel(128);
+                    replication.add_replica(tx).await;
+                    let stream = framed.into_inner();
+                    tokio::spawn(replication::serve_replica(rx, stream));
+                    info!("Connection transitioned to replica serving mode, breaking main loop.");
+                    return; // End this connection handler.
+                }
+                
                 let response = handle_command(
                     parsed_command,
                     &store,
                     &waiters,
                     &config,
+                    &replication,
                     &mut state,
                     &mut command_queue,
-                )
-                .await;
+                ).await;
 
                 if let Err(e) = framed.send(response).await {
                     error!("failed to send response: {e}");
@@ -82,27 +110,39 @@ async fn handle_command(
     store: &Arc<Store>,
     waiters: &Arc<WaiterRegistry>,
     config: &Arc<Config>,
+    replication: &Arc<ReplicationState>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
 ) -> RespValue {
-    if let Some(response) =
-        handle_transaction_state(parsed.clone(), state, queue, store, waiters, config).await
-    {
+    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters, config, replication).await {
         return response;
     }
-
+    
     if matches!(state, ConnectionState::InTransaction) {
         queue.push(parsed);
         return RespValue::SimpleString(Bytes::from_static(b"QUEUED"));
     }
 
-    match parsed.command() {
+    let command = parsed.command();
+    
+    let is_write_command = matches!(command, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
+    if is_write_command {
+        if replication.role() == replication::Role::Replica {
+            return RespValue::Error(Bytes::from_static(b"READONLY You can't write against a read only replica."));
+        }
+        Arc::clone(replication).propagate(parsed.clone());
+    }
+
+    match command {
         Command::Ping => RespValue::SimpleString(Bytes::from_static(b"PONG")),
         Command::Echo => handle_echo(parsed),
         Command::Set => handle_set(parsed, store),
         Command::Get => handle_get(parsed, store),
         Command::Config => handle_config(parsed, config),
         Command::Keys => handle_keys(parsed, store),
+        Command::Info => handle_info(parsed, replication),
+        Command::ReplConf => handle_replconf(parsed),
+        Command::Wait => handle_wait(parsed, replication).await,
         Command::Incr => handle_incr(parsed, store),
         Command::LPush => handle_push(parsed, store, waiters, true),
         Command::RPush => handle_push(parsed, store, waiters, false),
@@ -110,6 +150,7 @@ async fn handle_command(
         Command::LLen => handle_llen(parsed, store),
         Command::LRange => handle_lrange(parsed, store),
         Command::BLPop => handle_blpop(parsed, store, waiters).await,
+        Command::PSync => RespValue::Error(Bytes::from_static(b"ERR PSYNC cannot be called in this context")),
         _ => RespValue::Error(Bytes::from(format!(
             "ERR unknown command '{}'",
             parsed.command()
@@ -124,13 +165,12 @@ async fn handle_transaction_state(
     store: &Arc<Store>,
     waiters: &Arc<WaiterRegistry>,
     config: &Arc<Config>,
+    replication: &Arc<ReplicationState>,
 ) -> Option<RespValue> {
     match parsed.command() {
         Command::Multi => {
             if matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(
-                    b"ERR MULTI calls can not be nested",
-                )));
+                return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
             }
             *state = ConnectionState::InTransaction;
             queue.clear();
@@ -138,31 +178,19 @@ async fn handle_transaction_state(
         }
         Command::Exec => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(
-                    b"ERR EXEC without MULTI",
-                )));
+                return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
             }
             *state = ConnectionState::Normal;
             let mut responses = Vec::with_capacity(queue.len());
             for cmd in std::mem::take(queue) {
-                let response = Box::pin(handle_command(
-                    cmd,
-                    store,
-                    waiters,
-                    config,
-                    &mut ConnectionState::Normal,
-                    &mut vec![],
-                ))
-                .await;
+                let response = Box::pin(handle_command(cmd, store, waiters, config, replication, &mut ConnectionState::Normal, &mut vec![])).await;
                 responses.push(response);
             }
             Some(RespValue::Array(responses))
         }
         Command::Discard => {
             if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(
-                    b"ERR DISCARD without MULTI",
-                )));
+                return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
             }
             *state = ConnectionState::Normal;
             queue.clear();
@@ -172,18 +200,39 @@ async fn handle_transaction_state(
     }
 }
 
+fn handle_info(parsed: ParsedCommand, replication: &ReplicationState) -> RespValue {
+    let Some(section) = parsed.first() else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'info' command"));
+    };
+    if section.eq_ignore_ascii_case(b"replication") {
+        RespValue::BulkString(Bytes::from(replication.info_string()))
+    } else {
+        RespValue::BulkString(Bytes::from_static(b""))
+    }
+}
+
+fn handle_replconf(_parsed: ParsedCommand) -> RespValue {
+    RespValue::SimpleString(Bytes::from_static(b"OK"))
+}
+
+async fn handle_wait(parsed: ParsedCommand, replication: &ReplicationState) -> RespValue {
+    let (Some(_num_replicas_str), Some(_timeout_str)) = (parsed.arg(0), parsed.arg(1)) else {
+         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'wait' command"));
+    };
+    // A full implementation would parse these and use a new waiter mechanism.
+    // For now, we return the current number of connected replicas.
+    let count = replication.replica_count().await;
+    RespValue::Integer(count as i64)
+}
+
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
     let Some(verb) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'config' command",
-        ));
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'config' command"));
     };
     let Some(key_bytes) = parsed.arg(1) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'config' command",
-        ));
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'config' command"));
     };
-
+    
     if !verb.eq_ignore_ascii_case(b"get") {
         return RespValue::Error(Bytes::from_static(b"ERR CONFIG only supports GET"));
     }
@@ -207,12 +256,10 @@ fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
 }
 
 fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let Some(pattern) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'keys' command",
-        ));
+    let Some(pattern) = parsed.first() else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'keys' command"));
     };
-
+    
     if &pattern[..] != b"*" {
         warn!("Received KEYS command with non-'*' pattern, which is not supported.");
         return RespValue::Array(vec![]);
@@ -224,7 +271,7 @@ fn handle_keys(parsed: ParsedCommand, store: &Store) -> RespValue {
 
 fn handle_echo(parsed: ParsedCommand) -> RespValue {
     parsed
-        .arg(0)
+        .first()
         .map(|arg| RespValue::BulkString(arg.clone()))
         .unwrap_or_else(|| {
             RespValue::Error(Bytes::from_static(
@@ -235,9 +282,7 @@ fn handle_echo(parsed: ParsedCommand) -> RespValue {
 
 fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
     let (Some(key), Some(value)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'set' command",
-        ));
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'set' command"));
     };
 
     let mut expiry = None;
@@ -250,12 +295,10 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
                 {
                     expiry = Some(Duration::from_millis(millis));
                 } else {
-                    return RespValue::Error(Bytes::from_static(
-                        b"ERR value is not an integer or out of range",
-                    ));
+                    return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range"));
                 }
             } else {
-                return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
+                 return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
             }
         } else {
             return RespValue::Error(Bytes::from_static(b"ERR syntax error"));
@@ -269,10 +312,8 @@ fn handle_set(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let Some(key) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'get' command",
-        ));
+    let Some(key) = parsed.first() else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'get' command"));
     };
     match store.get_string(key) {
         Ok(Some(value)) => RespValue::BulkString(value),
@@ -282,10 +323,8 @@ fn handle_get(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let Some(key) = parsed.arg(0) else {
-        return RespValue::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'incr' command",
-        ));
+    let Some(key) = parsed.first() else {
+        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'incr' command"));
     };
     match store.incr(key) {
         Ok(new_value) => RespValue::Integer(new_value),
@@ -293,13 +332,8 @@ fn handle_incr(parsed: ParsedCommand, store: &Store) -> RespValue {
     }
 }
 
-fn handle_push(
-    parsed: ParsedCommand,
-    store: &Store,
-    waiters: &WaiterRegistry,
-    left: bool,
-) -> RespValue {
-    let Some(key) = parsed.arg(0) else {
+fn handle_push(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry, left: bool) -> RespValue {
+    let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
     let values = parsed.args_from(1);
@@ -315,7 +349,6 @@ fn handle_push(
 
     match new_len {
         Ok(len) => {
-            // Notify a waiting client *after* successfully pushing.
             if len > 0 {
                 waiters.notify_one(key);
             }
@@ -326,7 +359,7 @@ fn handle_push(
 }
 
 fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let Some(key) = parsed.arg(0) else {
+    let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
     let count = parsed
@@ -349,35 +382,21 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegistry) -> RespValue {
-    let Some(keys_arg) = parsed
-        .args_from(0)
+    let Some((keys, timeout_str)) = parsed.args_from(0)
         .split_last()
-        .map(|(last, elements)| (elements, last))
-    else {
+        .map(|(last, elements)| (elements, last)) else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let (keys, timeout_str) = keys_arg;
-    let timeout_secs = match std::str::from_utf8(timeout_str)
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
-    {
+    let timeout_secs = match std::str::from_utf8(timeout_str).ok().and_then(|s| s.parse::<f64>().ok()) {
         Some(t) => t,
-        None => {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR timeout is not a float or out of range",
-            ))
-        }
+        None => return RespValue::Error(Bytes::from_static(b"ERR timeout is not a float or out of range")),
     };
 
-    // First, try a non-blocking pop on all keys. This is the race-free way.
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![
-                    RespValue::BulkString(key.clone()),
-                    RespValue::BulkString(value),
-                ]);
+                return RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value)]);
             }
         }
     }
@@ -388,28 +407,22 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         Some(Duration::from_secs_f64(timeout_secs))
     };
 
-    // If all lists are empty, block and wait for a notification.
     waiters.wait_for_any(keys, timeout).await;
-
-    // After being woken up or timing out, we try to pop again.
-    // This re-check is what prevents the race condition.
+    
     for key in keys {
         if let Ok(Some(popped)) = store.lpop(key, 1) {
             if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![
-                    RespValue::BulkString(key.clone()),
-                    RespValue::BulkString(value),
-                ]);
+                return RespValue::Array(vec![RespValue::BulkString(key.clone()), RespValue::BulkString(value)]);
             }
         }
     }
-
-    // If we're here, we were either woken up and another client got the value first, or we timed out.
+    
     RespValue::NullBulkString
 }
 
+
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let Some(key) = parsed.arg(0) else {
+    let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
     match store.llen(key) {
@@ -419,33 +432,17 @@ fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
 }
 
 fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
-    let (Some(key), Some(start_str), Some(stop_str)) =
-        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
-    else {
+    let (Some(key), Some(start_str), Some(stop_str)) = (parsed.arg(0), parsed.arg(1), parsed.arg(2)) else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
 
-    let start = match std::str::from_utf8(start_str)
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-    {
+    let start = match std::str::from_utf8(start_str).ok().and_then(|s| s.parse::<i64>().ok()) {
         Some(i) => i,
-        None => {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ))
-        }
+        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
     };
-    let stop = match std::str::from_utf8(stop_str)
-        .ok()
-        .and_then(|s| s.parse::<i64>().ok())
-    {
+    let stop = match std::str::from_utf8(stop_str).ok().and_then(|s| s.parse::<i64>().ok()) {
         Some(i) => i,
-        None => {
-            return RespValue::Error(Bytes::from_static(
-                b"ERR value is not an integer or out of range",
-            ))
-        }
+        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
     };
 
     match store.lrange(key, start, stop) {
