@@ -92,7 +92,8 @@ pub async fn start_replica_mode(
     _replication: Arc<ReplicationState>,
 ) {
     info!("Attempting to connect to master at {master_addr}");
-    match TcpStream::connect(master_addr).await {
+    let corrected_addr = master_addr.replace(' ', ":");
+    match TcpStream::connect(corrected_addr).await {
         Ok(stream) => {
             info!("Successfully connected to master.");
             if let Err(e) = perform_handshake(stream, listening_port).await {
