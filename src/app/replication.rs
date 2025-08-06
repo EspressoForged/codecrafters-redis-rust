@@ -263,7 +263,7 @@ async fn perform_handshake(
                 if parsed_command.command() == Command::ReplConf
                     && parsed_command
                         .arg(0)
-                        .map_or(false, |a| a.eq_ignore_ascii_case(b"getack"))
+                        .is_some_and(|a| a.eq_ignore_ascii_case(b"getack"))
                 {
                     let ack_response = RespValue::Array(vec![
                         RespValue::BulkString(Bytes::from_static(b"REPLCONF")),
@@ -310,7 +310,7 @@ pub async fn serve_replica(
                             Ok(p) => p,
                             Err(e) => { warn!("Error parsing command from replica: {e}"); continue; },
                         };
-                        if parsed.command() == Command::ReplConf && parsed.arg(0).map_or(false, |a| a.eq_ignore_ascii_case(b"ack")) {
+                        if parsed.command() == Command::ReplConf && parsed.arg(0).is_some_and(|a| a.eq_ignore_ascii_case(b"ack")) {
                            if let Some(offset_bytes) = parsed.arg(1) {
                                if let Ok(offset_str) = std::str::from_utf8(offset_bytes) {
                                    if let Ok(offset) = offset_str.parse::<usize>() {

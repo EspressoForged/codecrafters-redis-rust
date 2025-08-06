@@ -1,5 +1,5 @@
 use crate::app::error::{AppError, WRONGTYPE_ERROR};
-use crate::app::stream::{Stream, StreamEntry, StreamId};
+use crate::app::stream::{Stream, StreamEntry, StreamId, XReadResult};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
@@ -271,10 +271,7 @@ impl Store {
         }
     }
 
-    pub fn xread(
-        &self,
-        keys_and_ids: &[(&Bytes, &str)],
-    ) -> Result<Option<Vec<(Bytes, Vec<StreamEntry>)>>, AppError> {
+    pub fn xread(&self, keys_and_ids: &[(&Bytes, &str)]) -> Result<Option<XReadResult>, AppError> {
         let mut results = Vec::new();
         for (key, id_spec) in keys_and_ids {
             let stream_data = match self.data.get(*key) {

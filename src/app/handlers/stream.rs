@@ -1,10 +1,9 @@
 use crate::app::command::Command;
 use crate::app::{
-    command::ParsedCommand, protocol::RespValue, store::Store, stream::StreamId,
+    command::ParsedCommand, protocol::RespValue, store::Store, stream::XReadResult,
     wait::WaiterRegistry,
 };
 use bytes::Bytes;
-// use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -202,7 +201,7 @@ async fn handle_xread(
     }
 }
 
-fn format_xread_response(results: Vec<(Bytes, Vec<(StreamId, Vec<(Bytes, Bytes)>)>)>) -> RespValue {
+fn format_xread_response(results: XReadResult) -> RespValue {
     let result_array = results
         .into_iter()
         .map(|(key, entries)| {

@@ -1,12 +1,20 @@
 use crate::app::error::AppError;
 use bytes::Bytes;
 use std::collections::BTreeMap;
-use std::ops::Bound; // <-- ADDED THIS IMPORT
+use std::fmt;
+use std::ops::Bound;
 use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// A type alias for a single field entry in a stream.
+pub type StreamEntryField = (Bytes, Bytes);
+/// A type alias for a single entry in a stream.
+pub type StreamEntry = (StreamId, Vec<StreamEntryField>);
+// Type alias for the complex structure returned by an XREAD command.
+pub type XReadResult = Vec<(Bytes, Vec<StreamEntry>)>;
+
 /// Represents a Stream Entry ID: <millisecondsTime>-<sequenceNumber>
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)] // <-- ADDED `Default`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct StreamId {
     ms_time: u64,
     seq_no: u64,
@@ -18,9 +26,9 @@ impl StreamId {
     }
 }
 
-impl ToString for StreamId {
-    fn to_string(&self) -> String {
-        format!("{}-{}", self.ms_time, self.seq_no)
+impl fmt::Display for StreamId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.ms_time, self.seq_no)
     }
 }
 
@@ -41,9 +49,6 @@ impl FromStr for StreamId {
         Ok(StreamId { ms_time, seq_no })
     }
 }
-
-/// A type alias for a single entry in a stream.
-pub type StreamEntry = (StreamId, Vec<(Bytes, Bytes)>);
 
 /// Represents a Redis Stream data structure.
 #[derive(Debug, Clone, Default)]
