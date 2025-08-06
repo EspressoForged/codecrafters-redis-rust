@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::time;
 use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
@@ -39,6 +40,7 @@ pub async fn handle_connection(
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
     let mut command_queue: Vec<ParsedCommand> = Vec::new();
+    let wait_notify = Arc::new(Notify::new()); // Notify for WAIT commands
 
     loop {
         match framed.next().await {
@@ -54,8 +56,6 @@ pub async fn handle_connection(
                     }
                 };
 
-                // PSYNC is a special case that transitions the connection state permanently.
-                // We handle it here at the top level to solve the ownership problem of `framed`.
                 if parsed_command.command() == Command::PSync {
                     info!("Replica requested PSYNC, starting full resync.");
                     let response = RespValue::SimpleString(Bytes::from(format!(
@@ -73,21 +73,15 @@ pub async fn handle_connection(
                     }
                     
                     let (tx, rx) = mpsc::channel(128);
-                    replication.add_replica(tx).await;
-                    let stream = framed.into_inner();
-                    tokio::spawn(replication::serve_replica(rx, stream));
+                    let ack_offset = replication.add_replica(tx).await;
+                    tokio::spawn(replication::serve_replica(rx, framed, ack_offset, Arc::clone(&wait_notify)));
                     info!("Connection transitioned to replica serving mode, breaking main loop.");
-                    return; // End this connection handler.
+                    return;
                 }
                 
                 let response = handle_command(
-                    parsed_command,
-                    &store,
-                    &waiters,
-                    &config,
-                    &replication,
-                    &mut state,
-                    &mut command_queue,
+                    parsed_command, &store, &waiters, &config, &replication,
+                    &mut state, &mut command_queue, &wait_notify,
                 ).await;
 
                 if let Err(e) = framed.send(response).await {
@@ -95,10 +89,7 @@ pub async fn handle_connection(
                     return;
                 }
             }
-            Some(Err(e)) => {
-                error!("error reading from stream: {e}");
-                return;
-            }
+            Some(Err(e)) => { error!("error reading from stream: {e}"); return; }
             None => return,
         }
     }
@@ -113,8 +104,9 @@ async fn handle_command(
     replication: &Arc<ReplicationState>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
+    wait_notify: &Arc<Notify>,
 ) -> RespValue {
-    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters, config, replication).await {
+    if let Some(response) = handle_transaction_state(parsed.clone(), state, queue, store, waiters, config, replication, wait_notify).await {
         return response;
     }
     
@@ -142,7 +134,7 @@ async fn handle_command(
         Command::Keys => handle_keys(parsed, store),
         Command::Info => handle_info(parsed, replication),
         Command::ReplConf => handle_replconf(parsed),
-        Command::Wait => handle_wait(parsed, replication).await,
+        Command::Wait => handle_wait(parsed, replication, wait_notify).await,
         Command::Incr => handle_incr(parsed, store),
         Command::LPush => handle_push(parsed, store, waiters, true),
         Command::RPush => handle_push(parsed, store, waiters, false),
@@ -151,10 +143,7 @@ async fn handle_command(
         Command::LRange => handle_lrange(parsed, store),
         Command::BLPop => handle_blpop(parsed, store, waiters).await,
         Command::PSync => RespValue::Error(Bytes::from_static(b"ERR PSYNC cannot be called in this context")),
-        _ => RespValue::Error(Bytes::from(format!(
-            "ERR unknown command '{}'",
-            parsed.command()
-        ))),
+        _ => RespValue::Error(Bytes::from(format!("ERR unknown command '{}'", parsed.command()))),
     }
 }
 
@@ -166,32 +155,27 @@ async fn handle_transaction_state(
     waiters: &Arc<WaiterRegistry>,
     config: &Arc<Config>,
     replication: &Arc<ReplicationState>,
+    wait_notify: &Arc<Notify>,
 ) -> Option<RespValue> {
     match parsed.command() {
         Command::Multi => {
-            if matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested")));
-            }
+            if matches!(state, ConnectionState::InTransaction) { return Some(RespValue::Error(Bytes::from_static(b"ERR MULTI calls can not be nested"))); }
             *state = ConnectionState::InTransaction;
             queue.clear();
             Some(RespValue::SimpleString(Bytes::from_static(b"OK")))
         }
         Command::Exec => {
-            if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
-            }
+            if !matches!(state, ConnectionState::InTransaction) { return Some(RespValue::Error(Bytes::from_static(b"ERR EXEC without MULTI"))); }
             *state = ConnectionState::Normal;
             let mut responses = Vec::with_capacity(queue.len());
             for cmd in std::mem::take(queue) {
-                let response = Box::pin(handle_command(cmd, store, waiters, config, replication, &mut ConnectionState::Normal, &mut vec![])).await;
+                let response = Box::pin(handle_command(cmd, store, waiters, config, replication, &mut ConnectionState::Normal, &mut vec![], wait_notify)).await;
                 responses.push(response);
             }
             Some(RespValue::Array(responses))
         }
         Command::Discard => {
-            if !matches!(state, ConnectionState::InTransaction) {
-                return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI")));
-            }
+            if !matches!(state, ConnectionState::InTransaction) { return Some(RespValue::Error(Bytes::from_static(b"ERR DISCARD without MULTI"))); }
             *state = ConnectionState::Normal;
             queue.clear();
             Some(RespValue::SimpleString(Bytes::from_static(b"OK")))
@@ -215,14 +199,55 @@ fn handle_replconf(_parsed: ParsedCommand) -> RespValue {
     RespValue::SimpleString(Bytes::from_static(b"OK"))
 }
 
-async fn handle_wait(parsed: ParsedCommand, replication: &ReplicationState) -> RespValue {
-    let (Some(_num_replicas_str), Some(_timeout_str)) = (parsed.arg(0), parsed.arg(1)) else {
+async fn handle_wait(parsed: ParsedCommand, replication: &ReplicationState, wait_notify: &Arc<Notify>) -> RespValue {
+    let (Some(num_replicas_str), Some(timeout_str)) = (parsed.arg(0), parsed.arg(1)) else {
          return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'wait' command"));
     };
-    // A full implementation would parse these and use a new waiter mechanism.
-    // For now, we return the current number of connected replicas.
-    let count = replication.replica_count().await;
-    RespValue::Integer(count as i64)
+    let num_replicas = match std::str::from_utf8(num_replicas_str).ok().and_then(|s| s.parse::<usize>().ok()) {
+        Some(n) => n,
+        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+    };
+    let timeout_ms = match std::str::from_utf8(timeout_str).ok().and_then(|s| s.parse::<u64>().ok()) {
+        Some(t) => t,
+        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+    };
+
+    let target_offset = replication.master_repl_offset();
+    
+    // Fast path: check if enough replicas are already synchronized.
+    let already_synced = replication.count_acks(target_offset).await;
+    if already_synced >= num_replicas {
+        return RespValue::Integer(already_synced as i64);
+    }
+    
+    // Slow path: broadcast GETACK and wait.
+    replication.broadcast_getack().await;
+
+    // Register this command's waiting condition.
+    // The `wait_notify` is cloned and sent to the registry.
+    replication.wait_waiters.register_wait_notifier(Arc::clone(wait_notify)).await;
+
+    let timeout_future = time::sleep(Duration::from_millis(timeout_ms));
+    tokio::pin!(timeout_future);
+
+    loop {
+        tokio::select! {
+            _ = &mut timeout_future => {
+                // Timeout elapsed, return the number of replicas that have synced so far.
+                let final_count = replication.count_acks(target_offset).await;
+                return RespValue::Integer(final_count as i64);
+            }
+            _ = wait_notify.notified() => {
+                // An ACK was received, check if we've met the condition.
+                let synced_count = replication.count_acks(target_offset).await;
+                if synced_count >= num_replicas {
+                    return RespValue::Integer(synced_count as i64);
+                }
+                // If not enough replicas are synced, and we were notified,
+                // this means another ACK came in, so we loop to await more.
+            }
+        }
+    }
 }
 
 fn handle_config(parsed: ParsedCommand, config: &Config) -> RespValue {
