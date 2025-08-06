@@ -7,7 +7,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_util::codec::Framed;
@@ -88,15 +88,17 @@ impl ReplicationState {
 pub async fn start_replica_mode(
     master_addr: String,
     listening_port: u16,
-    _store: Arc<Store>,
-    _replication: Arc<ReplicationState>,
+    store: Arc<Store>,
+    replication: Arc<ReplicationState>,
 ) {
     info!("Attempting to connect to master at {master_addr}");
+    
     let corrected_addr = master_addr.replace(' ', ":");
-    match TcpStream::connect(corrected_addr).await {
+
+    match TcpStream::connect(&corrected_addr).await {
         Ok(stream) => {
             info!("Successfully connected to master.");
-            if let Err(e) = perform_handshake(stream, listening_port).await {
+            if let Err(e) = perform_handshake(stream, listening_port, store, replication).await {
                 error!("Handshake with master failed: {e}");
             }
         }
@@ -106,7 +108,12 @@ pub async fn start_replica_mode(
     }
 }
 
-async fn perform_handshake(stream: TcpStream, listening_port: u16) -> Result<()> {
+async fn perform_handshake(
+    stream: TcpStream,
+    listening_port: u16,
+    store: Arc<Store>, // Now used to apply commands
+    _replication: Arc<ReplicationState>,
+) -> Result<()> {
     let mut framed = Framed::new(stream, RespDecoder);
 
     framed.send(RespValue::Array(vec![RespValue::BulkString(Bytes::from_static(b"PING"))])).await?;
@@ -133,7 +140,31 @@ async fn perform_handshake(stream: TcpStream, listening_port: u16) -> Result<()>
     ])).await?;
     let _ = framed.next().await.unwrap()?;
 
-    info!("Handshake complete. Listening for commands from master.");
+    info!("Handshake complete. Receiving RDB file from master.");
+    
+    // Manually read and discard the RDB file before proceeding.
+    // The `Framed` object still holds the underlying stream and any buffered bytes.
+    let mut stream = framed.into_inner();
+    let mut len_buffer = [0; 10]; // Buffer for the length part, e.g., $88\r\n
+    let mut len_bytes_read = 0;
+    loop {
+        let byte = stream.read_u8().await?;
+        len_buffer[len_bytes_read] = byte;
+        len_bytes_read += 1;
+        if len_bytes_read > 2 && len_buffer[len_bytes_read-2] == b'\r' && len_buffer[len_bytes_read-1] == b'\n' {
+            break;
+        }
+    }
+    let len_str = std::str::from_utf8(&len_buffer[1..len_bytes_read-2])?;
+    let rdb_len = len_str.parse::<usize>()?;
+    
+    let mut rdb_buffer = vec![0; rdb_len];
+    stream.read_exact(&mut rdb_buffer).await?;
+    
+    // Now that the RDB file is consumed, re-frame the stream to parse RESP commands.
+    let mut framed = Framed::new(stream, RespDecoder);
+
+    info!("RDB file consumed. Listening for propagated commands.");
 
     let mut offset = 0usize;
     loop {
@@ -142,6 +173,22 @@ async fn perform_handshake(stream: TcpStream, listening_port: u16) -> Result<()>
                 debug!("Replica received value from master: {value:?}");
                 let raw_bytes = value.encode_to_bytes();
                 let parsed_command = ParsedCommand::from_resp(value)?;
+                
+                // As a replica, we must now apply write commands to our own store.
+                let cmd = parsed_command.command();
+                let is_write = matches!(cmd, Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr);
+
+                if is_write {
+                    // This is a simplified dispatch. A real implementation would reuse `app/mod.rs` logic.
+                    match cmd {
+                        Command::Set => {
+                             let (Some(key), Some(val)) = (parsed_command.arg(0), parsed_command.arg(1)) else { continue };
+                             store.set_string(key.clone(), val.clone(), None)?;
+                        },
+                        // Other write commands would be handled here.
+                        _ => {}
+                    }
+                }
 
                 if parsed_command.command() == Command::ReplConf {
                     if parsed_command.arg(0).map_or(false, |a| a.eq_ignore_ascii_case(b"getack")) {
@@ -165,7 +212,7 @@ async fn perform_handshake(stream: TcpStream, listening_port: u16) -> Result<()>
             }
         }
     }
-
+    
     Ok(())
 }
 
