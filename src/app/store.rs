@@ -36,7 +36,7 @@ impl Store {
             self.data.insert(key, value);
         }
     }
-    
+
     pub fn get_all_keys(&self) -> Vec<Bytes> {
         self.data
             .iter()
@@ -44,7 +44,7 @@ impl Store {
             .map(|entry| entry.key().clone())
             .collect()
     }
-    
+
     pub fn get_type(&self, key: &Bytes) -> String {
         match self.data.get(key) {
             Some(entry) if !Self::is_expired(&entry) => match entry.data {
@@ -56,7 +56,7 @@ impl Store {
             _ => "none".to_string(),
         }
     }
-    
+
     // --- Sorted Set Commands ---
 
     pub fn zadd(&self, key: Bytes, score: f64, member: Bytes) -> Result<usize, AppError> {
@@ -73,7 +73,7 @@ impl Store {
             _ => Err(WRONGTYPE_ERROR),
         }
     }
-    
+
     pub fn zcard(&self, key: &Bytes) -> Result<usize, AppError> {
         match self.data.get(key) {
             Some(entry) if !Self::is_expired(&entry) => match &entry.data {
@@ -165,7 +165,12 @@ impl Store {
         }
     }
 
-    pub fn set_string(&self, key: Bytes, value: Bytes, expiry: Option<Duration>) -> Result<(), AppError> {
+    pub fn set_string(
+        &self,
+        key: Bytes,
+        value: Bytes,
+        expiry: Option<Duration>,
+    ) -> Result<(), AppError> {
         if let Some(mut entry) = self.data.get_mut(&key) {
             // Allow overwriting a key of any type with a string.
             let expires_at = expiry.and_then(|d| Instant::now().checked_add(d));
@@ -199,7 +204,7 @@ impl Store {
                     .ok_or(AppError::ValueError(
                         "value is not an integer or out of range".into(),
                     ))?;
-                
+
                 let new_val = current_val + 1;
                 *bytes = Bytes::from(new_val.to_string());
                 Ok(new_val)
@@ -327,7 +332,12 @@ impl Store {
 
     // --- Stream Commands ---
 
-    pub fn xadd(&self, key: Bytes, id_spec: &str, fields: Vec<(Bytes, Bytes)>) -> Result<StreamId, AppError> {
+    pub fn xadd(
+        &self,
+        key: Bytes,
+        id_spec: &str,
+        fields: Vec<(Bytes, Bytes)>,
+    ) -> Result<StreamId, AppError> {
         let mut entry = self.data.entry(key).or_insert_with(|| StoreValue {
             data: DataType::Stream(Stream::new()),
             expires_at: None,
@@ -339,7 +349,12 @@ impl Store {
         }
     }
 
-    pub fn xrange(&self, key: &Bytes, start: &str, end: &str) -> Result<Vec<StreamEntry>, AppError> {
+    pub fn xrange(
+        &self,
+        key: &Bytes,
+        start: &str,
+        end: &str,
+    ) -> Result<Vec<StreamEntry>, AppError> {
         match self.data.get(key) {
             Some(entry) if !Self::is_expired(&entry) => match &entry.data {
                 DataType::Stream(stream) => stream.range(start, end),
@@ -348,7 +363,7 @@ impl Store {
             _ => Ok(vec![]),
         }
     }
-    
+
     pub fn xread(&self, keys_and_ids: &[(&Bytes, &str)]) -> Result<Option<XReadResult>, AppError> {
         let mut results = Vec::new();
         for (key, id_spec) in keys_and_ids {
@@ -358,7 +373,9 @@ impl Store {
                         let entries = stream.read_from(id_spec)?;
                         if !entries.is_empty() {
                             Some(((*key).clone(), entries))
-                        } else { None }
+                        } else {
+                            None
+                        }
                     }
                     _ => return Err(WRONGTYPE_ERROR),
                 },
@@ -368,14 +385,14 @@ impl Store {
                 results.push(data);
             }
         }
-        
+
         if results.is_empty() {
             Ok(None)
         } else {
             Ok(Some(results))
         }
     }
-    
+
     pub fn get_stream_last_id(&self, key: &Bytes) -> Option<StreamId> {
         self.data.get(key).and_then(|entry| {
             if let DataType::Stream(s) = &entry.data {
@@ -391,7 +408,7 @@ impl Store {
     fn is_expired(value: &StoreValue) -> bool {
         matches!(value.expires_at, Some(t) if Instant::now() > t)
     }
-    
+
     fn normalize_index(index: i64, len: i64) -> usize {
         if index >= 0 {
             index as usize

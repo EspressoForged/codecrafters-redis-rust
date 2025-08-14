@@ -4,6 +4,6 @@ pub mod pubsub;
 pub mod replication;
 pub mod server;
 pub mod sorted_set;
-pub mod string;
 pub mod stream;
+pub mod string;
 pub mod transaction;

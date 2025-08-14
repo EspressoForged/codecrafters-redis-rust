@@ -19,11 +19,18 @@ pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 }
 
 fn handle_zadd(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
-    let (Some(key), Some(score_bytes), Some(member)) = (parsed.arg(0), parsed.arg(1), parsed.arg(2)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zadd' command"));
+    let (Some(key), Some(score_bytes), Some(member)) =
+        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
+    else {
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zadd' command",
+        ));
     };
 
-    let score = match std::str::from_utf8(score_bytes).ok().and_then(|s| s.parse::<f64>().ok()) {
+    let score = match std::str::from_utf8(score_bytes)
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+    {
         Some(f) => f,
         None => return RespValue::Error(Bytes::from_static(b"ERR value is not a valid float")),
     };
@@ -36,7 +43,9 @@ fn handle_zadd(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 
 fn handle_zcard(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     let Some(key) = parsed.first() else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zcard' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zcard' command",
+        ));
     };
     match store.zcard(key) {
         Ok(count) => RespValue::Integer(count as i64),
@@ -46,7 +55,9 @@ fn handle_zcard(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 
 fn handle_zscore(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     let (Some(key), Some(member)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zscore' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zscore' command",
+        ));
     };
     match store.zscore(key, member) {
         Ok(Some(score)) => RespValue::BulkString(Bytes::from(score.to_string())),
@@ -57,7 +68,9 @@ fn handle_zscore(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 
 fn handle_zrank(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     let (Some(key), Some(member)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zrank' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zrank' command",
+        ));
     };
     match store.zrank(key, member) {
         Ok(Some(rank)) => RespValue::Integer(rank as i64),
@@ -67,17 +80,35 @@ fn handle_zrank(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 }
 
 fn handle_zrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
-    let (Some(key), Some(start_bytes), Some(stop_bytes)) = (parsed.arg(0), parsed.arg(1), parsed.arg(2)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zrange' command"));
+    let (Some(key), Some(start_bytes), Some(stop_bytes)) =
+        (parsed.arg(0), parsed.arg(1), parsed.arg(2))
+    else {
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zrange' command",
+        ));
     };
 
-    let start = match std::str::from_utf8(start_bytes).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let start = match std::str::from_utf8(start_bytes)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
-    let stop = match std::str::from_utf8(stop_bytes).ok().and_then(|s| s.parse::<i64>().ok()) {
+    let stop = match std::str::from_utf8(stop_bytes)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+    {
         Some(i) => i,
-        None => return RespValue::Error(Bytes::from_static(b"ERR value is not an integer or out of range")),
+        None => {
+            return RespValue::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            ))
+        }
     };
 
     match store.zrange(key, start, stop) {
@@ -88,7 +119,9 @@ fn handle_zrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
 
 fn handle_zrem(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     let (Some(key), Some(member)) = (parsed.arg(0), parsed.arg(1)) else {
-        return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments for 'zrem' command"));
+        return RespValue::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'zrem' command",
+        ));
     };
     match store.zrem(key, member) {
         Ok(count) => RespValue::Integer(count as i64),

@@ -1,6 +1,6 @@
 use bytes::Bytes;
-use std::collections::{BTreeSet, HashMap};
 use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
 
 /// Represents an item within the BTreeSet for sorting.
 /// Implements Ord to sort by score first, then lexicographically by member.
@@ -24,7 +24,9 @@ impl PartialOrd for SortedSetItem {
 
 impl Ord for SortedSetItem {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.score.cmp(&other.score).then_with(|| self.member.cmp(&other.member))
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.member.cmp(&other.member))
     }
 }
 
@@ -61,7 +63,11 @@ impl SortedSet {
         let is_new = self.scores.insert(member, score).is_none();
         self.sorted_items.insert(new_item);
 
-        if is_new { 1 } else { 0 }
+        if is_new {
+            1
+        } else {
+            0
+        }
     }
 
     /// Returns the 0-based rank of a member.
