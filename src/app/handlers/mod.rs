@@ -3,6 +3,7 @@ pub mod list;
 pub mod pubsub;
 pub mod replication;
 pub mod server;
-pub mod stream;
+pub mod sorted_set;
 pub mod string;
+pub mod stream;
 pub mod transaction;

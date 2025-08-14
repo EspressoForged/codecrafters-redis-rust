@@ -36,3 +36,5 @@ strum_macros = "0.24"
 
 # High performance HashMap
 dashmap = "5.5"
+
+ordered-float = "4.2.0"

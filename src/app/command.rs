@@ -33,6 +33,12 @@ pub enum Command {
     Subscribe,
     Publish,
     Unsubscribe,
+    ZAdd,
+    ZCard,
+    ZScore,
+    ZRank,
+    ZRange,
+    ZRem,
 }
 
 #[derive(Debug, Clone)]
@@ -59,9 +65,7 @@ impl ParsedCommand {
                 let args = iter
                     .map(|val| match val {
                         RespValue::BulkString(bytes) => Ok(bytes),
-                        _ => Err(AppError::ParseError(
-                            "Argument must be a bulk string".into(),
-                        )),
+                        _ => Err(AppError::ParseError("Argument must be a bulk string".into())),
                     })
                     .collect::<Result<Vec<Bytes>, _>>()?;
 
@@ -78,7 +82,7 @@ impl ParsedCommand {
     pub fn arg(&self, index: usize) -> Option<&Bytes> {
         self.args.get(index)
     }
-
+    
     pub fn first(&self) -> Option<&Bytes> {
         self.args.first()
     }
@@ -90,7 +94,7 @@ impl ParsedCommand {
             &self.args[start_index..]
         }
     }
-
+    
     pub fn into_resp_array(self) -> RespValue {
         let mut parts = Vec::with_capacity(self.args.len() + 1);
         parts.push(RespValue::BulkString(Bytes::from(self.command.to_string())));
