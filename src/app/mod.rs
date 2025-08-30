@@ -20,12 +20,13 @@ use tracing::{error, info};
 
 pub mod command;
 pub mod error;
+pub mod geo;
 pub mod handlers;
 pub mod protocol;
 pub mod pubsub;
 pub mod rdb;
 pub mod replication;
-pub mod sorted_set; // <-- NEW
+pub mod sorted_set;
 pub mod store;
 pub mod stream;
 pub mod wait;
@@ -219,6 +220,7 @@ pub async fn handle_command(
             | Command::XAdd
             | Command::ZAdd
             | Command::ZRem
+            | Command::GeoAdd
     );
     if is_write_command {
         if replication.role() == replication::Role::Replica {
@@ -248,13 +250,17 @@ pub async fn handle_command(
         Command::XAdd | Command::XRange | Command::XRead => {
             handlers::stream::handle(parsed, store, waiters).await
         }
-        // NEW: Route all Z* commands to the new handler.
+        // Route all Z* commands to the handler.
         Command::ZAdd
         | Command::ZCard
         | Command::ZScore
         | Command::ZRank
         | Command::ZRange
         | Command::ZRem => handlers::sorted_set::handle(parsed, store),
+        // Route all GEO* commands to the geo handler.
+        Command::GeoAdd | Command::GeoPos | Command::GeoDist => {
+            handlers::geo::handle(parsed, store)
+        }
         _ => RespValue::Error(Bytes::from(format!(
             "ERR unknown command '{}'",
             parsed.command()

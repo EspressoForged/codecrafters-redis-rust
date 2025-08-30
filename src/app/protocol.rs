@@ -18,6 +18,7 @@ pub enum RespValue {
     BulkString(Bytes),
     NullBulkString,
     Array(Vec<RespValue>),
+    NullArray,
 }
 
 impl RespValue {
@@ -176,6 +177,9 @@ impl Encoder<RespValue> for RespDecoder {
                 for item in items {
                     self.encode(item, dst)?;
                 }
+            }
+            RespValue::NullArray => {
+                dst.extend_from_slice(b"*-1\r\n");
             }
         }
         Ok(())

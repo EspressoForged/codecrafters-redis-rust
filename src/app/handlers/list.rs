@@ -126,7 +126,7 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     }
 
-    RespValue::NullBulkString
+    RespValue::NullArray
 }
 
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {

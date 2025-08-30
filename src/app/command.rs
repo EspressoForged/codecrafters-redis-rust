@@ -33,12 +33,18 @@ pub enum Command {
     Subscribe,
     Publish,
     Unsubscribe,
+    // Sorted Set Commands
     ZAdd,
     ZCard,
     ZScore,
     ZRank,
     ZRange,
     ZRem,
+    // Geospatial Commands
+    GeoAdd,
+    GeoPos,
+    GeoDist,
+    GeoSearch,
 }
 
 #[derive(Debug, Clone)]

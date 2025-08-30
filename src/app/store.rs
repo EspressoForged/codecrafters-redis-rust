@@ -1,4 +1,5 @@
 use crate::app::error::{AppError, WRONGTYPE_ERROR};
+use crate::app::geo;
 use crate::app::sorted_set::SortedSet;
 use crate::app::stream::{Stream, StreamEntry, StreamId, XReadResult};
 use bytes::Bytes;
@@ -51,7 +52,7 @@ impl Store {
                 DataType::String(_) => "string".to_string(),
                 DataType::List(_) => "list".to_string(),
                 DataType::Stream(_) => "stream".to_string(),
-                DataType::SortedSet(_) => "zset".to_string(), // <-- NEW
+                DataType::SortedSet(_) => "zset".to_string(),
             },
             _ => "none".to_string(),
         }
@@ -143,6 +144,64 @@ impl Store {
                 _ => Err(WRONGTYPE_ERROR),
             },
             _ => Ok(0), // Key doesn't exist
+        }
+    }
+
+    // --- Geospatial Commands ---
+
+    pub fn geoadd(
+        &self,
+        key: Bytes,
+        longitude: f64,
+        latitude: f64,
+        member: Bytes,
+    ) -> Result<usize, AppError> {
+        // Validate coordinates
+        if !(-180.0..=180.0).contains(&longitude) {
+            return Err(AppError::ValueError(format!(
+                "invalid longitude,latitude pair {longitude},{latitude}"
+            )));
+        }
+        if !(-85.05112878..=85.05112878).contains(&latitude) {
+            return Err(AppError::ValueError(format!(
+                "invalid longitude,latitude pair {longitude},{latitude}"
+            )));
+        }
+
+        let score = geo::encode(latitude, longitude) as f64;
+        self.zadd(key, score, member)
+    }
+
+    pub fn geopos(
+        &self,
+        key: &Bytes,
+        members: &[Bytes],
+    ) -> Result<Vec<Option<geo::Coordinates>>, AppError> {
+        let mut results = Vec::with_capacity(members.len());
+        for member in members {
+            match self.zscore(key, member)? {
+                Some(score) => {
+                    let coords = geo::decode(score as u64);
+                    results.push(Some(coords));
+                }
+                None => results.push(None),
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn geodist(
+        &self,
+        key: &Bytes,
+        member1: &Bytes,
+        member2: &Bytes,
+    ) -> Result<Option<f64>, AppError> {
+        let pos1 = self.geopos(key, std::slice::from_ref(member1))?.remove(0);
+        let pos2 = self.geopos(key, std::slice::from_ref(member2))?.remove(0);
+
+        match (pos1, pos2) {
+            (Some(c1), Some(c2)) => Ok(Some(geo::distance(c1, c2))),
+            _ => Ok(None),
         }
     }
 

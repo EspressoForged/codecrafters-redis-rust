@@ -152,7 +152,7 @@ async fn handle_xread(
     let keys = &args[..num_keys];
     let id_specs_bytes = &args[num_keys..];
 
-    // CORRECTED: Resolve the '$' ID for each stream *before* the first read attempt.
+    // Resolve the '$' ID for each stream *before* the first read attempt.
     let resolved_ids: Vec<String> = id_specs_bytes
         .iter()
         .zip(keys.iter())
@@ -197,7 +197,7 @@ async fn handle_xread(
     // We use the *same resolved IDs* from before the block.
     match store.xread(&keys_and_ids) {
         Ok(Some(results)) if !results.is_empty() => format_xread_response(results),
-        _ => RespValue::NullBulkString, // Timed out or another client got the data
+        _ => RespValue::NullArray, // Timed out or another client got the data
     }
 }
 

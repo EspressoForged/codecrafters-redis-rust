@@ -1,4 +1,5 @@
 pub mod connection;
+pub mod geo;
 pub mod list;
 pub mod pubsub;
 pub mod replication;
