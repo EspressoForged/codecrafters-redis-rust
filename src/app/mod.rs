@@ -258,7 +258,7 @@ pub async fn handle_command(
         | Command::ZRange
         | Command::ZRem => handlers::sorted_set::handle(parsed, store),
         // Route all GEO* commands to the geo handler.
-        Command::GeoAdd | Command::GeoPos | Command::GeoDist => {
+        Command::GeoAdd | Command::GeoPos | Command::GeoDist | Command::GeoSearch => {
             handlers::geo::handle(parsed, store)
         }
         _ => RespValue::Error(Bytes::from(format!(

@@ -205,6 +205,39 @@ impl Store {
         }
     }
 
+    pub fn geosearch(
+        &self,
+        key: &Bytes,
+        center: geo::Coordinates,
+        radius_meters: f64,
+    ) -> Result<Vec<Bytes>, AppError> {
+        let entry = match self.data.get(key) {
+            Some(entry) if !Self::is_expired(&entry) => entry,
+            _ => return Ok(vec![]), // Key doesn't exist or is expired
+        };
+
+        let zset_lock = match &entry.data {
+            DataType::SortedSet(lock) => lock,
+            _ => return Err(WRONGTYPE_ERROR),
+        };
+
+        let zset = zset_lock.read().unwrap();
+        let mut results = Vec::new();
+
+        // This is an inefficient O(n) scan.
+        for member in zset.get_all_members() {
+            if let Some(score) = zset.score_of(&member) {
+                let member_coords = geo::decode(score.round() as u64);
+                let distance = geo::distance(center, member_coords);
+                if distance <= radius_meters {
+                    results.push(member);
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
     // --- String Commands ---
 
     pub fn get_string(&self, key: &Bytes) -> Result<Option<Bytes>, AppError> {

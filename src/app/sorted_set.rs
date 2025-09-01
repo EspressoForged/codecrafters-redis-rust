@@ -70,6 +70,11 @@ impl SortedSet {
         }
     }
 
+    /// Helper to get all members for iteration in GEOSEARCH.
+    pub fn get_all_members(&self) -> Vec<Bytes> {
+        self.scores.iter().map(|entry| entry.0.clone()).collect()
+    }
+
     /// Returns the 0-based rank of a member.
     pub fn rank_of(&self, member: &Bytes) -> Option<usize> {
         let score = self.scores.get(member)?;
