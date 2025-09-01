@@ -1,6 +1,5 @@
 use crate::app::{
     command::{Command, ParsedCommand},
-    // geo,
     protocol::RespValue,
     store::Store,
 };
