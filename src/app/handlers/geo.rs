@@ -1,11 +1,13 @@
 use crate::app::{
     command::{Command, ParsedCommand},
+    error::AppError,
     geo,
     protocol::RespValue,
-    store::Store,
+    sorted_set::SortedSet,
+    store::{DataType, Store, StoreValue},
 };
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     match parsed.command() {
@@ -14,6 +16,36 @@ pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         Command::GeoDist => handle_geodist(parsed, store),
         Command::GeoSearch => handle_geosearch(parsed, store),
         _ => RespValue::Error(Bytes::from_static(b"ERR unknown geo command")),
+    }
+}
+
+// Helper for ZADD logic used by GEOADD
+fn internal_zadd(store: &Store, key: Bytes, score: f64, member: Bytes) -> Result<usize, AppError> {
+    let entry = store.db().entry(key).or_insert_with(|| StoreValue {
+        data: DataType::SortedSet(RwLock::new(SortedSet::new())),
+        expires_at: None,
+    });
+
+    match &entry.value().data {
+        DataType::SortedSet(zset_lock) => {
+            let mut zset = zset_lock.write().unwrap();
+            Ok(zset.add(score, member))
+        }
+        _ => Err(crate::app::error::WRONGTYPE_ERROR),
+    }
+}
+
+// Helper for ZSCORE logic used by GEOPOS and GEODIST
+fn internal_zscore(store: &Store, key: &Bytes, member: &Bytes) -> Result<Option<f64>, AppError> {
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                Ok(zset.score_of(member))
+            }
+            _ => Err(crate::app::error::WRONGTYPE_ERROR),
+        },
+        _ => Ok(None),
     }
 }
 
@@ -41,7 +73,19 @@ fn handle_geoadd(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         None => return RespValue::Error(Bytes::from_static(b"ERR value is not a valid float")),
     };
 
-    match store.geoadd(key.clone(), longitude, latitude, member.clone()) {
+    if !(-180.0..=180.0).contains(&longitude) {
+        return RespValue::Error(Bytes::from(format!(
+            "ERR invalid longitude,latitude pair {longitude},{latitude}"
+        )));
+    }
+    if !(-85.05112878..=85.05112878).contains(&latitude) {
+        return RespValue::Error(Bytes::from(format!(
+            "ERR invalid longitude,latitude pair {longitude},{latitude}"
+        )));
+    }
+
+    let score = geo::encode(latitude, longitude) as f64;
+    match internal_zadd(store, key.clone(), score, member.clone()) {
         Ok(count) => RespValue::Integer(count as i64),
         Err(e) => RespValue::Error(Bytes::from(e.to_string())),
     }
@@ -55,22 +99,21 @@ fn handle_geopos(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     };
     let members = parsed.args_from(1);
 
-    match store.geopos(key, members) {
-        Ok(positions) => {
-            let result_array = positions
-                .into_iter()
-                .map(|opt_coords| match opt_coords {
-                    Some(coords) => RespValue::Array(vec![
-                        RespValue::BulkString(Bytes::from(coords.longitude.to_string())),
-                        RespValue::BulkString(Bytes::from(coords.latitude.to_string())),
-                    ]),
-                    None => RespValue::NullArray,
-                })
-                .collect();
-            RespValue::Array(result_array)
+    let mut results = Vec::with_capacity(members.len());
+    for member in members {
+        match internal_zscore(store, key, member) {
+            Ok(Some(score)) => {
+                let coords = geo::decode(score as u64);
+                results.push(RespValue::Array(vec![
+                    RespValue::BulkString(Bytes::from(coords.longitude.to_string())),
+                    RespValue::BulkString(Bytes::from(coords.latitude.to_string())),
+                ]));
+            }
+            Ok(None) => results.push(RespValue::NullArray),
+            Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
         }
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
     }
+    RespValue::Array(results)
 }
 
 fn handle_geodist(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
@@ -81,10 +124,20 @@ fn handle_geodist(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         ));
     };
 
-    match store.geodist(key, member1, member2) {
-        Ok(Some(distance)) => RespValue::BulkString(Bytes::from(format!("{:.4}", distance))),
-        Ok(None) => RespValue::NullBulkString, // One or both members don't exist
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    let pos1 = match internal_zscore(store, key, member1) {
+        Ok(Some(score)) => Some(geo::decode(score as u64)),
+        Ok(None) => None,
+        Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
+    };
+    let pos2 = match internal_zscore(store, key, member2) {
+        Ok(Some(score)) => Some(geo::decode(score as u64)),
+        Ok(None) => None,
+        Err(e) => return RespValue::Error(Bytes::from(e.to_string())),
+    };
+
+    match (pos1, pos2) {
+        (Some(c1), Some(c2)) => RespValue::BulkString(Bytes::from(format!("{:.4}", geo::distance(c1, c2)))),
+        _ => RespValue::NullBulkString,
     }
 }
 
@@ -151,8 +204,24 @@ fn handle_geosearch(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         latitude: center_lat,
     };
 
-    match store.geosearch(key, center_coords, radius_meters) {
-        Ok(members) => RespValue::Array(members.into_iter().map(RespValue::BulkString).collect()),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                let mut results = Vec::new();
+                for member in zset.get_all_members() {
+                    if let Some(score) = zset.score_of(&member) {
+                        let member_coords = geo::decode(score.round() as u64);
+                        let distance = geo::distance(center_coords, member_coords);
+                        if distance <= radius_meters {
+                            results.push(RespValue::BulkString(member));
+                        }
+                    }
+                }
+                RespValue::Array(results)
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Array(vec![]),
     }
 }

@@ -1,5 +1,5 @@
 use crate::app::{
-    command::{Command, ParsedCommand},
+    command::{Command, CommandHandler, ParsedCommand},
     protocol::{RespDecoder, RespValue},
     pubsub::PubSubHub,
     replication::ReplicationState,
@@ -9,7 +9,7 @@ use crate::app::{
 use crate::config::Config;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -33,6 +33,87 @@ pub mod wait;
 
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
+pub type CommandRegistry = HashMap<Command, Arc<dyn CommandHandler>>;
+
+pub struct AppContext {
+    pub store: Arc<Store>,
+    pub config: Arc<Config>,
+    pub replication: Arc<ReplicationState>,
+    pub pubsub: Arc<PubSubHub>,
+    pub waiters: Arc<WaiterRegistry>,
+    pub registry: CommandRegistry,
+}
+
+impl AppContext {
+    pub fn new(
+        store: Arc<Store>,
+        config: Arc<Config>,
+        replication: Arc<ReplicationState>,
+        pubsub: Arc<PubSubHub>,
+        waiters: Arc<WaiterRegistry>,
+    ) -> Self {
+        let mut registry: CommandRegistry = HashMap::new();
+
+        let connection_handler = Arc::new(handlers::ConnectionHandler);
+        registry.insert(Command::Ping, connection_handler.clone());
+        registry.insert(Command::Echo, connection_handler);
+
+        let string_handler = Arc::new(handlers::StringHandler);
+        registry.insert(Command::Set, string_handler.clone());
+        registry.insert(Command::Get, string_handler.clone());
+        registry.insert(Command::Incr, string_handler);
+
+        let server_handler = Arc::new(handlers::ServerHandler);
+        registry.insert(Command::Config, server_handler.clone());
+        registry.insert(Command::Keys, server_handler.clone());
+        registry.insert(Command::Type, server_handler);
+
+        let replication_handler = Arc::new(handlers::ReplicationHandler);
+        registry.insert(Command::Info, replication_handler.clone());
+        registry.insert(Command::ReplConf, replication_handler.clone());
+        registry.insert(Command::Wait, replication_handler);
+
+        let list_handler = Arc::new(handlers::ListHandler);
+        registry.insert(Command::LPush, list_handler.clone());
+        registry.insert(Command::RPush, list_handler.clone());
+        registry.insert(Command::LPop, list_handler.clone());
+        registry.insert(Command::LLen, list_handler.clone());
+        registry.insert(Command::LRange, list_handler.clone());
+        registry.insert(Command::BLPop, list_handler);
+
+        let stream_handler = Arc::new(handlers::StreamHandler);
+        registry.insert(Command::XAdd, stream_handler.clone());
+        registry.insert(Command::XRange, stream_handler.clone());
+        registry.insert(Command::XRead, stream_handler);
+
+        let sorted_set_handler = Arc::new(handlers::SortedSetHandler);
+        registry.insert(Command::ZAdd, sorted_set_handler.clone());
+        registry.insert(Command::ZCard, sorted_set_handler.clone());
+        registry.insert(Command::ZScore, sorted_set_handler.clone());
+        registry.insert(Command::ZRank, sorted_set_handler.clone());
+        registry.insert(Command::ZRange, sorted_set_handler.clone());
+        registry.insert(Command::ZRem, sorted_set_handler);
+
+        let geo_handler = Arc::new(handlers::GeoHandler);
+        registry.insert(Command::GeoAdd, geo_handler.clone());
+        registry.insert(Command::GeoPos, geo_handler.clone());
+        registry.insert(Command::GeoDist, geo_handler.clone());
+        registry.insert(Command::GeoSearch, geo_handler);
+
+        let pubsub_handler = Arc::new(handlers::PubSubHandler);
+        registry.insert(Command::Publish, pubsub_handler);
+
+        Self {
+            store,
+            config,
+            replication,
+            pubsub,
+            waiters,
+            registry,
+        }
+    }
+}
+
 pub enum ConnectionState {
     Normal,
     InTransaction,
@@ -44,14 +125,7 @@ pub enum ConnectionState {
     },
 }
 
-pub async fn handle_connection(
-    stream: TcpStream,
-    store: Arc<Store>,
-    waiters: Arc<WaiterRegistry>,
-    config: Arc<Config>,
-    replication: Arc<ReplicationState>,
-    pubsub: Arc<PubSubHub>,
-) {
+pub async fn handle_connection(stream: TcpStream, ctx: Arc<AppContext>) {
     let client_id = NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed);
     let mut framed = Framed::new(stream, RespDecoder);
     let mut state = ConnectionState::Normal;
@@ -71,14 +145,14 @@ pub async fn handle_connection(
                 subscriptions,
                 tx,
                 rx,
-                &pubsub,
+                &ctx.pubsub,
                 client_id,
             )
             .await
             .is_err()
             {
                 info!("Client {client_id} disconnected from subscribed mode.");
-                pubsub.unsubscribe_all(client_id, subscriptions);
+                ctx.pubsub.unsubscribe_all(client_id, subscriptions);
                 return;
             }
         }
@@ -102,7 +176,7 @@ pub async fn handle_connection(
                     let (tx, rx) = mpsc::channel(128);
                     let (response, new_subs) = handlers::pubsub::subscribe(
                         parsed_command,
-                        &pubsub,
+                        &ctx.pubsub,
                         client_id,
                         tx.clone(),
                         &HashSet::new(),
@@ -124,7 +198,7 @@ pub async fn handle_connection(
                     info!("Replica requested PSYNC, starting full resync.");
                     let response = RespValue::SimpleString(Bytes::from(format!(
                         "FULLRESYNC {} 0",
-                        replication.master_replid()
+                        ctx.replication.master_replid()
                     )));
                     if let Err(e) = framed.send(response).await {
                         error!("Failed to send FULLRESYNC response: {e}");
@@ -137,7 +211,7 @@ pub async fn handle_connection(
                     }
 
                     let (tx, rx) = mpsc::channel(128);
-                    let ack_offset = replication.add_replica(tx).await;
+                    let ack_offset = ctx.replication.add_replica(tx).await;
                     tokio::spawn(replication::serve_replica(
                         rx,
                         framed,
@@ -150,11 +224,7 @@ pub async fn handle_connection(
 
                 let response = handle_command(
                     parsed_command,
-                    &store,
-                    &waiters,
-                    &config,
-                    &replication,
-                    &pubsub,
+                    &ctx,
                     &mut state,
                     &mut command_queue,
                     &wait_notify,
@@ -175,14 +245,22 @@ pub async fn handle_connection(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+pub async fn apply_command(ctx: &Arc<AppContext>, parsed: ParsedCommand) -> RespValue {
+    let command = parsed.command();
+    let wait_notify = Arc::new(Notify::new()); // Dummy notify for non-connection-based apply
+    if let Some(handler) = ctx.registry.get(&command) {
+        handler.handle(ctx, parsed, &wait_notify).await
+    } else {
+        RespValue::Error(Bytes::from(format!(
+            "ERR unknown command '{}'",
+            parsed.command()
+        )))
+    }
+}
+
 pub async fn handle_command(
     parsed: ParsedCommand,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-    config: &Arc<Config>,
-    replication: &Arc<ReplicationState>,
-    pubsub: &Arc<PubSubHub>,
+    ctx: &Arc<AppContext>,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
     wait_notify: &Arc<Notify>,
@@ -191,11 +269,7 @@ pub async fn handle_command(
         parsed.clone(),
         state,
         queue,
-        store,
-        waiters,
-        config,
-        replication,
-        pubsub,
+        ctx,
         wait_notify,
     )
     .await
@@ -223,47 +297,20 @@ pub async fn handle_command(
             | Command::GeoAdd
     );
     if is_write_command {
-        if replication.role() == replication::Role::Replica {
+        if ctx.replication.role() == replication::Role::Replica {
             return RespValue::Error(Bytes::from_static(
                 b"READONLY You can't write against a read only replica.",
             ));
         }
-        Arc::clone(replication).propagate(parsed.clone());
+        Arc::clone(&ctx.replication).propagate(parsed.clone());
     }
 
-    match command {
-        Command::Ping | Command::Echo => handlers::connection::handle(parsed),
-        Command::Set | Command::Get | Command::Incr => handlers::string::handle(parsed, store),
-        Command::Config | Command::Keys | Command::Type => {
-            handlers::server::handle(parsed, config, store)
-        }
-        Command::Info | Command::ReplConf | Command::Wait => {
-            handlers::replication::handle(parsed, replication, wait_notify).await
-        }
-        Command::Publish => handlers::pubsub::publish(parsed, pubsub),
-        Command::LPush
-        | Command::RPush
-        | Command::LPop
-        | Command::LLen
-        | Command::LRange
-        | Command::BLPop => handlers::list::handle(parsed, store, waiters).await,
-        Command::XAdd | Command::XRange | Command::XRead => {
-            handlers::stream::handle(parsed, store, waiters).await
-        }
-        // Route all Z* commands to the handler.
-        Command::ZAdd
-        | Command::ZCard
-        | Command::ZScore
-        | Command::ZRank
-        | Command::ZRange
-        | Command::ZRem => handlers::sorted_set::handle(parsed, store),
-        // Route all GEO* commands to the geo handler.
-        Command::GeoAdd | Command::GeoPos | Command::GeoDist | Command::GeoSearch => {
-            handlers::geo::handle(parsed, store)
-        }
-        _ => RespValue::Error(Bytes::from(format!(
+    if let Some(handler) = ctx.registry.get(&command) {
+        handler.handle(ctx, parsed, wait_notify).await
+    } else {
+        RespValue::Error(Bytes::from(format!(
             "ERR unknown command '{}'",
             parsed.command()
-        ))),
+        )))
     }
 }

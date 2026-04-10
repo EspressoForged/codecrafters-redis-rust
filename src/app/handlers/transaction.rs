@@ -1,21 +1,15 @@
 use crate::app::{
-    command::ParsedCommand, pubsub::PubSubHub, replication::ReplicationState, store::Store,
-    wait::WaiterRegistry, ConnectionState, RespValue,
+    command::ParsedCommand, AppContext, ConnectionState, RespValue,
 };
 use bytes::Bytes;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
-#[allow(clippy::too_many_arguments)]
 pub async fn handle_state(
     parsed: ParsedCommand,
     state: &mut ConnectionState,
     queue: &mut Vec<ParsedCommand>,
-    store: &Arc<Store>,
-    waiters: &Arc<WaiterRegistry>,
-    config: &Arc<crate::config::Config>,
-    replication: &Arc<ReplicationState>,
-    pubsub: &Arc<PubSubHub>,
+    ctx: &Arc<AppContext>,
     wait_notify: &Arc<Notify>,
 ) -> Option<RespValue> {
     match parsed.command() {
@@ -40,11 +34,7 @@ pub async fn handle_state(
             for cmd in std::mem::take(queue) {
                 let response = Box::pin(crate::app::handle_command(
                     cmd,
-                    store,
-                    waiters,
-                    config,
-                    replication,
-                    pubsub,
+                    ctx,
                     &mut ConnectionState::Normal,
                     &mut vec![],
                     wait_notify,

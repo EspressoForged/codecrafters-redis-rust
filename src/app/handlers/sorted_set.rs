@@ -1,10 +1,11 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     protocol::RespValue,
-    store::Store,
+    sorted_set::SortedSet,
+    store::{DataType, Store, StoreValue},
 };
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub fn handle(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
     match parsed.command() {
@@ -35,9 +36,17 @@ fn handle_zadd(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         None => return RespValue::Error(Bytes::from_static(b"ERR value is not a valid float")),
     };
 
-    match store.zadd(key.clone(), score, member.clone()) {
-        Ok(count) => RespValue::Integer(count as i64),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    let entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
+        data: DataType::SortedSet(RwLock::new(SortedSet::new())),
+        expires_at: None,
+    });
+
+    match &entry.value().data {
+        DataType::SortedSet(zset_lock) => {
+            let mut zset = zset_lock.write().unwrap();
+            RespValue::Integer(zset.add(score, member.clone()) as i64)
+        }
+        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     }
 }
 
@@ -47,9 +56,16 @@ fn handle_zcard(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
             b"ERR wrong number of arguments for 'zcard' command",
         ));
     };
-    match store.zcard(key) {
-        Ok(count) => RespValue::Integer(count as i64),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                RespValue::Integer(zset.cardinality() as i64)
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Integer(0), // Key doesn't exist
     }
 }
 
@@ -59,10 +75,19 @@ fn handle_zscore(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
             b"ERR wrong number of arguments for 'zscore' command",
         ));
     };
-    match store.zscore(key, member) {
-        Ok(Some(score)) => RespValue::BulkString(Bytes::from(score.to_string())),
-        Ok(None) => RespValue::NullBulkString,
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                match zset.score_of(member) {
+                    Some(score) => RespValue::BulkString(Bytes::from(score.to_string())),
+                    None => RespValue::NullBulkString,
+                }
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::NullBulkString, // Key doesn't exist
     }
 }
 
@@ -72,10 +97,19 @@ fn handle_zrank(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
             b"ERR wrong number of arguments for 'zrank' command",
         ));
     };
-    match store.zrank(key, member) {
-        Ok(Some(rank)) => RespValue::Integer(rank as i64),
-        Ok(None) => RespValue::NullBulkString,
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                match zset.rank_of(member) {
+                    Some(rank) => RespValue::Integer(rank as i64),
+                    None => RespValue::NullBulkString,
+                }
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::NullBulkString, // Key doesn't exist
     }
 }
 
@@ -111,9 +145,23 @@ fn handle_zrange(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
         }
     };
 
-    match store.zrange(key, start, stop) {
-        Ok(members) => RespValue::Array(members.into_iter().map(RespValue::BulkString).collect()),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let zset = zset_lock.read().unwrap();
+                let len = zset.cardinality() as i64;
+                let start_idx = store.normalize_index(start, len);
+                let stop_idx = store.normalize_index(stop, len);
+
+                if start_idx > stop_idx {
+                    return RespValue::Array(vec![]);
+                }
+                let members = zset.get_range(start_idx, stop_idx);
+                RespValue::Array(members.into_iter().map(RespValue::BulkString).collect())
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Array(vec![]), // Key doesn't exist
     }
 }
 
@@ -123,8 +171,15 @@ fn handle_zrem(parsed: ParsedCommand, store: &Arc<Store>) -> RespValue {
             b"ERR wrong number of arguments for 'zrem' command",
         ));
     };
-    match store.zrem(key, member) {
-        Ok(count) => RespValue::Integer(count as i64),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::SortedSet(zset_lock) => {
+                let mut zset = zset_lock.write().unwrap();
+                RespValue::Integer(zset.remove(member) as i64)
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Integer(0), // Key doesn't exist
     }
 }

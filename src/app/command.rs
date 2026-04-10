@@ -1,7 +1,20 @@
-use crate::app::{error::AppError, protocol::RespValue};
+use crate::app::{error::AppError, protocol::RespValue, AppContext};
+use async_trait::async_trait;
 use bytes::Bytes;
 use std::str::FromStr;
+use std::sync::Arc;
 use strum_macros::{Display, EnumString};
+use tokio::sync::Notify;
+
+#[async_trait]
+pub trait CommandHandler: Send + Sync {
+    async fn handle(
+        &self,
+        ctx: &Arc<AppContext>,
+        parsed: ParsedCommand,
+        wait_notify: &Arc<Notify>,
+    ) -> RespValue;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Display, EnumString)]
 #[strum(serialize_all = "UPPERCASE", ascii_case_insensitive)]

@@ -1,9 +1,14 @@
 use crate::app::command::Command;
-use crate::app::{command::ParsedCommand, protocol::RespValue, store::Store, wait::WaiterRegistry};
+use crate::app::{
+    command::ParsedCommand,
+    protocol::RespValue,
+    store::{DataType, Store, StoreValue},
+    wait::WaiterRegistry,
+};
 use bytes::Bytes;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-// use tracing::warn;
 
 pub async fn handle(
     parsed: ParsedCommand,
@@ -35,20 +40,27 @@ fn handle_push(
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     }
 
-    let new_len = if left {
-        store.lpush(key.clone(), values)
-    } else {
-        store.rpush(key.clone(), values)
-    };
+    let mut entry = store.db().entry(key.clone()).or_insert_with(|| StoreValue {
+        data: DataType::List(VecDeque::new()),
+        expires_at: None,
+    });
 
-    match new_len {
-        Ok(len) => {
+    match &mut entry.value_mut().data {
+        DataType::List(list) => {
+            for value in values {
+                if left {
+                    list.push_front(value.clone());
+                } else {
+                    list.push_back(value.clone());
+                }
+            }
+            let len = list.len();
             if len > 0 {
                 waiters.notify_one(key);
             }
             RespValue::Integer(len as i64)
         }
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     }
 }
 
@@ -62,16 +74,37 @@ fn handle_lpop(parsed: ParsedCommand, store: &Store) -> RespValue {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(1);
 
-    match store.lpop(key, count) {
-        Ok(Some(popped)) => {
+    let mut entry = match store.db().get_mut(key) {
+        Some(entry) => entry,
+        None => return RespValue::NullBulkString,
+    };
+
+    if store.is_expired(&entry) {
+        drop(entry);
+        store.db().remove(key);
+        return RespValue::NullBulkString;
+    }
+
+    match &mut entry.value_mut().data {
+        DataType::List(list) => {
+            if list.is_empty() {
+                return RespValue::NullBulkString;
+            }
+            let mut popped = Vec::with_capacity(count);
+            for _ in 0..count {
+                if let Some(val) = list.pop_front() {
+                    popped.push(val);
+                } else {
+                    break;
+                }
+            }
             if popped.len() == 1 && count == 1 {
                 RespValue::BulkString(popped.into_iter().next().unwrap())
             } else {
                 RespValue::Array(popped.into_iter().map(RespValue::BulkString).collect())
             }
         }
-        Ok(None) => RespValue::NullBulkString,
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+        _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
     }
 }
 
@@ -96,15 +129,30 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
         }
     };
 
-    for key in keys {
-        if let Ok(Some(popped)) = store.lpop(key, 1) {
-            if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![
-                    RespValue::BulkString(key.clone()),
-                    RespValue::BulkString(value),
-                ]);
+    let try_pop = |store: &Store, keys: &[Bytes]| {
+        for key in keys {
+            let mut entry = match store.db().get_mut(key) {
+                Some(entry) => entry,
+                None => continue,
+            };
+
+            if store.is_expired(&entry) {
+                drop(entry);
+                store.db().remove(key);
+                continue;
+            }
+
+            if let DataType::List(list) = &mut entry.value_mut().data {
+                if let Some(value) = list.pop_front() {
+                    return Some((key.clone(), value));
+                }
             }
         }
+        None
+    };
+
+    if let Some((key, value)) = try_pop(store, keys) {
+        return RespValue::Array(vec![RespValue::BulkString(key), RespValue::BulkString(value)]);
     }
 
     let timeout = if timeout_secs == 0.0 {
@@ -115,27 +163,23 @@ async fn handle_blpop(parsed: ParsedCommand, store: &Store, waiters: &WaiterRegi
 
     waiters.wait_for_any(keys, timeout).await;
 
-    for key in keys {
-        if let Ok(Some(popped)) = store.lpop(key, 1) {
-            if let Some(value) = popped.into_iter().next() {
-                return RespValue::Array(vec![
-                    RespValue::BulkString(key.clone()),
-                    RespValue::BulkString(value),
-                ]);
-            }
-        }
+    if let Some((key, value)) = try_pop(store, keys) {
+        RespValue::Array(vec![RespValue::BulkString(key), RespValue::BulkString(value)])
+    } else {
+        RespValue::NullArray
     }
-
-    RespValue::NullArray
 }
 
 fn handle_llen(parsed: ParsedCommand, store: &Store) -> RespValue {
     let Some(key) = parsed.first() else {
         return RespValue::Error(Bytes::from_static(b"ERR wrong number of arguments"));
     };
-    match store.llen(key) {
-        Ok(len) => RespValue::Integer(len as i64),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::List(list) => RespValue::Integer(list.len() as i64),
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Integer(0),
     }
 }
 
@@ -169,8 +213,28 @@ fn handle_lrange(parsed: ParsedCommand, store: &Store) -> RespValue {
         }
     };
 
-    match store.lrange(key, start, stop) {
-        Ok(items) => RespValue::Array(items.into_iter().map(RespValue::BulkString).collect()),
-        Err(e) => RespValue::Error(Bytes::from(e.to_string())),
+    match store.db().get(key) {
+        Some(entry) if !store.is_expired(&entry) => match &entry.data {
+            DataType::List(list) => {
+                let len = list.len() as i64;
+                let start_idx = store.normalize_index(start, len);
+                let stop_idx = store.normalize_index(stop, len);
+
+                if start_idx > stop_idx {
+                    return RespValue::Array(vec![]);
+                }
+
+                let items = list
+                    .iter()
+                    .skip(start_idx)
+                    .take(stop_idx - start_idx + 1)
+                    .cloned()
+                    .map(RespValue::BulkString)
+                    .collect();
+                RespValue::Array(items)
+            }
+            _ => RespValue::Error(Bytes::from_static(b"WRONGTYPE Operation against a key holding the wrong kind of value")),
+        },
+        _ => RespValue::Array(vec![]),
     }
 }

@@ -1,7 +1,7 @@
 use crate::app::{
     command::{Command, ParsedCommand},
     protocol::{RespDecoder, RespValue},
-    store::Store,
+    AppContext,
 };
 use anyhow::Result;
 use bytes::{Buf, Bytes};
@@ -137,8 +137,7 @@ impl ReplicationState {
 pub async fn start_replica_mode(
     master_addr: String,
     listening_port: u16,
-    store: Arc<Store>,
-    replication: Arc<ReplicationState>,
+    ctx: Arc<AppContext>,
 ) {
     let corrected_addr = master_addr.replace(' ', ":");
     info!("Attempting to connect to master at {}", corrected_addr);
@@ -146,7 +145,7 @@ pub async fn start_replica_mode(
     match TcpStream::connect(&corrected_addr).await {
         Ok(stream) => {
             info!("Successfully connected to master.");
-            if let Err(e) = perform_handshake(stream, listening_port, store, replication).await {
+            if let Err(e) = perform_handshake(stream, listening_port, ctx).await {
                 error!("Handshake with master failed: {e}");
             }
         }
@@ -159,8 +158,7 @@ pub async fn start_replica_mode(
 async fn perform_handshake(
     stream: TcpStream,
     listening_port: u16,
-    store: Arc<Store>,
-    _replication: Arc<ReplicationState>,
+    ctx: Arc<AppContext>,
 ) -> Result<()> {
     let mut framed = Framed::new(stream, RespDecoder);
 
@@ -240,23 +238,13 @@ async fn perform_handshake(
                 let cmd = parsed_command.command();
                 let is_write = matches!(
                     cmd,
-                    Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr
+                    Command::Set | Command::LPush | Command::RPush | Command::LPop | Command::Incr | Command::XAdd | Command::ZAdd | Command::ZRem | Command::GeoAdd
                 );
 
                 if is_write {
-                    match cmd {
-                        Command::Set => {
-                            if let (Some(key), Some(val)) =
-                                (parsed_command.arg(0), parsed_command.arg(1))
-                            {
-                                if let Err(e) = store.set_string(key.clone(), val.clone(), None) {
-                                    warn!("Replica failed to apply SET command: {e}");
-                                }
-                            }
-                        }
-                        _ => {
-                            warn!("Unsupported write command on replica: {:?}", cmd);
-                        }
+                    let response = crate::app::apply_command(&ctx, parsed_command.clone()).await;
+                    if let RespValue::Error(e) = response {
+                        warn!("Replica failed to apply write command {:?}: {}", cmd, String::from_utf8_lossy(&e));
                     }
                 }
 

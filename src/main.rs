@@ -46,19 +46,26 @@ async fn main() -> Result<()> {
     let waiters = Arc::new(WaiterRegistry::new());
     let pubsub_hub = Arc::new(PubSubHub::new());
 
-    if replication_state.role() == app::replication::Role::Replica {
-        let master_addr = config.replicaof.clone().unwrap();
+    let ctx = Arc::new(app::AppContext::new(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        replication_state,
+        pubsub_hub,
+        waiters,
+    ));
+
+    if ctx.replication.role() == app::replication::Role::Replica {
+        let master_addr = ctx.config.replicaof.clone().unwrap();
         info!("Running in replica mode, will connect to master at {master_addr}");
         let repl_task = app::replication::start_replica_mode(
             master_addr,
-            config.port,
-            Arc::clone(&store),
-            Arc::clone(&replication_state),
+            ctx.config.port,
+            Arc::clone(&ctx),
         );
         tokio::spawn(repl_task);
     }
 
-    let listener = TcpListener::bind(config.listen_addr()).await?;
+    let listener = TcpListener::bind(ctx.config.listen_addr()).await?;
 
     let shutdown_signal = async {
         signal::ctrl_c()
@@ -67,25 +74,10 @@ async fn main() -> Result<()> {
     };
 
     let connection_handler = {
-        let store = Arc::clone(&store);
-        let waiters = Arc::clone(&waiters);
-        let config = Arc::clone(&config);
-        let replication_state = Arc::clone(&replication_state);
-        let pubsub_hub = Arc::clone(&pubsub_hub);
+        let ctx = Arc::clone(&ctx);
         move |stream| {
-            let store = Arc::clone(&store);
-            let waiters = Arc::clone(&waiters);
-            let config = Arc::clone(&config);
-            let replication_state = Arc::clone(&replication_state);
-            let pubsub_hub = Arc::clone(&pubsub_hub);
-            app::handle_connection(
-                stream,
-                store,
-                waiters,
-                config,
-                replication_state,
-                pubsub_hub,
-            )
+            let ctx = Arc::clone(&ctx);
+            app::handle_connection(stream, ctx)
         }
     };
 
